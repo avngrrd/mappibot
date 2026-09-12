@@ -9,9 +9,12 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='12' fill='%23101c35'/%3E%3Cpath d='M9 28V12l11 9 11-9v16' fill='none' stroke='%232be2dc' stroke-width='5' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
   <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/features.css">
   <script src="/app.js"></script>
   <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
   <script src="/vendor/leaflet/leaflet.js" defer></script>
+  <script src="/journeys.js" defer></script>
+  <script src="/schedules.js" defer></script>
 </head>
 <body>
   <section id="welcome" class="welcome" aria-labelledby="welcome-title">
@@ -68,6 +71,13 @@
       <div class="sheet-content">
         <section id="map-panel" class="panel" aria-label="Поточний транспорт">
           <div class="live-summary"><span class="live-summary-icon" aria-hidden="true">↗</span><div><strong id="live-count">Завантажуємо позиції</strong><p id="live-updated">Лише координати не старші 3 хвилин</p></div></div>
+          <div class="layer-toggles" aria-label="Шари карти">
+            <label class="layer-toggle"><input id="toggle-gps" type="checkbox" checked><span>GPS</span></label>
+            <label class="layer-toggle"><input id="toggle-lines" type="checkbox" checked><span>Схеми</span></label>
+            <label class="layer-toggle"><input id="toggle-stops" type="checkbox" checked><span>Зупинки</span></label>
+          </div>
+          <div id="map-mode-filters" class="map-mode-filters" aria-label="Типи GPS транспорту на карті"></div>
+          <div id="active-routes" class="active-routes" hidden></div>
           <button id="nearby" type="button" class="button button-primary nearby-button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 10c0 5-7 11-7 11S5 15 5 10a7 7 0 1 1 14 0Z"/><circle cx="12" cy="10" r="2.5"/></svg>Зупинки в центрі карти<span aria-hidden="true">→</span></button>
           <p class="field-note">Перемістіть карту до потрібного місця й натисніть кнопку.</p>
           <div id="nearby-results" class="result-list"></div>
@@ -83,6 +93,7 @@
               <button type="button" data-mode="trolleybus" class="mode-chip" aria-pressed="false">Тролейбус</button>
               <button type="button" data-mode="tram" class="mode-chip" aria-pressed="false">Трамвай</button>
               <button type="button" data-mode="subway" class="mode-chip" aria-pressed="false">Метро</button>
+              <button type="button" data-mode="light_rail" class="mode-chip" aria-pressed="false">Легкорейковий</button>
             </div>
             <div class="list-heading"><span id="routes-count">Каталог OpenStreetMap</span><span>За напрямками</span></div>
             <div id="routes-results" class="result-list" aria-live="polite"></div>
@@ -95,8 +106,9 @@
           <div id="search-results" class="result-list"><div class="empty-state"><span class="empty-symbol" aria-hidden="true">⌕</span><h2>Знайдіть своє місце</h2><p>Вулиця, площа або вокзал. Після пошуку покажемо місце та зупинки поруч.</p></div></div>
         </section>
 
-        <section id="favorites-panel" class="panel" aria-label="Обрані зупинки" hidden>
-          <div class="list-heading"><span>Ваші зупинки</span><span>Лише на цьому пристрої</span></div>
+        <section id="favorites-panel" class="panel" aria-label="Обрані маршрути та зупинки" hidden>
+          <div class="favorites-tabs" aria-label="Тип обраного"><button id="favorites-stops" type="button" class="is-active" aria-pressed="true">Зупинки</button><button id="favorites-routes" type="button" aria-pressed="false">Маршрути</button></div>
+          <div class="list-heading"><span id="favorites-count">Обране</span><span>Лише на цьому пристрої</span></div>
           <div id="favorites-results" class="result-list"></div>
           <button id="clear-favorites" class="text-button clear-favorites" type="button" hidden>Очистити обране на цьому пристрої</button>
         </section>
@@ -110,7 +122,10 @@
       <div class="source-item"><span class="source-dot"></span><div><strong>GPS · часткове покриття</strong><p>Лише власні часові позначки позицій не старші 3 хвилин. Відсутність машини на карті не означає, що рейсів немає. Прогнозу прибуття немає.</p></div></div>
       <div class="source-item"><span class="source-dot osm"></span><div><strong>Маршрути та зупинки · OpenStreetMap</strong><p>Довідкові дані можуть бути неповними. Напрямки показано окремо, як їх внесено до карти; актуальність руху не гарантована.</p></div></div>
       <p class="privacy-note">Обране зберігається лише в цьому браузері. Геолокацію запитуємо після натискання кнопки.</p>
+      <p class="privacy-note">Коли ви плануєте поїздку, координати її пішої частини передаються routing.openstreetmap.de для побудови шляху.</p>
       <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener" class="source-link">© OpenStreetMap contributors ↗</a>
+      <a href="https://routing.openstreetmap.de/about.html" target="_blank" rel="noopener" class="source-link routing-source">Піші маршрути · routing.openstreetmap.de ↗</a>
+      <a href="https://kpt.kyiv.ua/changes-in-traffic" target="_blank" rel="noopener" class="source-link">Зміни руху · Київпастранс ↗</a>
       <button id="close-about-bottom" class="button button-primary" type="button">Зрозуміло</button>
     </dialog>
   </main>

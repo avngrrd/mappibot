@@ -34,6 +34,9 @@ const ASSETS = new Map([
   ['/index.html', ['web/index.html', 'text/html']],
   ['/app.css', ['web/app.css', 'text/css']],
   ['/app.js', ['web/app.js', 'text/javascript']],
+  ['/journeys.js', ['web/journeys.js', 'text/javascript']],
+  ['/schedules.js', ['web/schedules.js', 'text/javascript']],
+  ['/features.css', ['web/features.css', 'text/css']],
   ['/vendor/leaflet/leaflet.js', ['node_modules/leaflet/dist/leaflet.js', 'text/javascript']],
   ['/vendor/leaflet/leaflet.css', ['node_modules/leaflet/dist/leaflet.css', 'text/css']],
   ...['layers.png', 'layers-2x.png', 'marker-icon.png', 'marker-icon-2x.png', 'marker-shadow.png']
@@ -57,7 +60,7 @@ async function readJson(request) {
 }
 
 /** The tunnel connects over loopback, so loopback itself NEVER grants API access. */
-export function createMapServer({ botToken, previewKey = '', store, allowedUserIds = [], providers, mapData, now = Date.now }) {
+export function createMapServer({ botToken, previewKey = '', store, allowedUserIds = [], providers, mapData, planner, schedules, easyway, now = Date.now }) {
   const sessions = new Map();
   const allowed = new Set(allowedUserIds.map(String));
   const authorized = id => allowed.has(id) || Object.hasOwn(store.users, id);
@@ -103,12 +106,54 @@ export function createMapServer({ botToken, previewKey = '', store, allowedUserI
         sessions.delete(token);
         throw new ApiError(401, 'Сесію завершено. Відкрийте карту в боті ще раз.');
       }
-      if (request.method !== 'GET') throw new ApiError(405, 'Метод не підтримується.');
+      const postOnly = ['/api/journeys', '/api/stop-routes'].includes(url.pathname);
+      if (request.method !== (postOnly ? 'POST' : 'GET')) throw new ApiError(405, 'Метод не підтримується.');
       if (now() - session.window >= 60_000) { session.window = now(); session.requests = 0; }
       if (++session.requests > 90 || active >= 16) throw new ApiError(429, 'Забагато запитів. Спробуйте за кілька секунд.');
       active++;
       try {
         switch (url.pathname) {
+          case '/api/capabilities': return reply(response, 200, {
+            journeys: Boolean(planner), schedules: Boolean(schedules),
+            easyway: { configured: Boolean(easyway?.configured), connected: false,
+              notice: 'Доступ до API EasyWay потребує окремого облікового запису та перевірки наданих даних.' }
+          });
+          case '/api/journeys': {
+            if (!planner) throw new ApiError(503, 'Планування ще недоступне.');
+            const body = await readJson(request);
+            const point = value => value && typeof value.lat === 'number' && typeof value.lon === 'number'
+              && Number.isFinite(value.lat) && Number.isFinite(value.lon)
+              && value.lat >= 50.2 && value.lat <= 50.7 && value.lon >= 30.2 && value.lon <= 30.9;
+            const modes = ['bus', 'trolleybus', 'tram', 'subway', 'light_rail'];
+            if (!point(body?.from) || !point(body?.to)) throw new ApiError(400, 'Оберіть дві точки в межах Києва.');
+            if (!Array.isArray(body.modes) || !body.modes.length || body.modes.length > 5 || body.modes.some(mode => !modes.includes(mode))
+              || ![0, 1].includes(body.maxTransfers) || !['transfers', 'walk'].includes(body.sort)) throw new ApiError(400, 'Перевірте параметри поїздки.');
+            return reply(response, 200, await planner.plan({
+              from: { lat: body.from.lat, lon: body.from.lon }, to: { lat: body.to.lat, lon: body.to.lon },
+              modes: [...new Set(body.modes)], maxTransfers: body.maxTransfers, sort: body.sort
+            }));
+          }
+          case '/api/stop-routes': {
+            const body = await readJson(request);
+            const stop = body?.stop;
+            const validId = id => typeof id === 'string' && /^(node|way|relation)\/[1-9]\d{0,14}$/.test(id);
+            if (!validId(stop?.id) || (stop.osmIds !== undefined && (!Array.isArray(stop.osmIds) || stop.osmIds.length > 20 || stop.osmIds.some(id => !validId(id))))) {
+              throw new ApiError(400, 'Некоректна зупинка.');
+            }
+            return reply(response, 200, { routes: await providers.stopRoutes({ id: stop.id, ...(stop.osmIds ? { osmIds: stop.osmIds } : {}) }) });
+          }
+          case '/api/schedules/catalog': {
+            if (!schedules) throw new ApiError(503, 'Розклади ще недоступні.');
+            return reply(response, 200, await schedules.catalog());
+          }
+          case '/api/schedules': {
+            if (!schedules) throw new ApiError(503, 'Розклади ще недоступні.');
+            const system = url.searchParams.get('system'), station = url.searchParams.get('station');
+            if (!['metro', 'rail', 'funicular'].includes(system) || !/^[A-Za-z0-9_-]{1,40}$/.test(station || '')) throw new ApiError(400, 'Оберіть станцію з переліку.');
+            const catalog = await schedules.catalog();
+            if (!catalog.systems.find(item => item.id === system)?.stations.some(item => String(item.id) === station)) throw new ApiError(400, 'Станції немає в переліку.');
+            return reply(response, 200, await schedules.timetable(system, station));
+          }
           case '/api/live': return reply(response, 200, await providers.liveKyiv());
           case '/api/routes': return reply(response, 200, { routes: await mapData.listRoutes() });
           case '/api/route': {
@@ -133,8 +178,9 @@ export function createMapServer({ botToken, previewKey = '', store, allowedUserI
       } finally { active--; }
     } catch (error) {
       // Provider/request errors may contain a URL or personal input: return only a controlled message.
-      if (!response.headersSent) reply(response, error instanceof ApiError ? error.status : 503,
-        { error: error instanceof ApiError ? error.message : 'Джерело даних зараз недоступне. Спробуйте ще раз.' });
+      const invalidInput = error?.code === 'INVALID_INPUT';
+      if (!response.headersSent) reply(response, error instanceof ApiError ? error.status : invalidInput ? 400 : 503,
+        { error: error instanceof ApiError ? error.message : invalidInput ? 'Перевірте точки та параметри поїздки.' : 'Джерело даних зараз недоступне. Спробуйте ще раз.' });
       else response.end();
     }
   });

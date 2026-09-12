@@ -78,6 +78,29 @@ test('arbitrary relation IDs and injected query syntax cannot bypass the Kyiv ca
   assert.equal(calls, 1);
 });
 
+test('validated journey candidates remain drawable across stale catalogs without opening arbitrary relation lookup', async () => {
+  let time = NOW;
+  const queries = [];
+  const map = createMapData({ now: () => time, fetchImpl: async (_, options) => {
+    const query = new URLSearchParams(options.body).get('data');
+    queries.push(query);
+    return reply(query.includes('out tags') ? payload([]) : geometry());
+  } });
+  assert.deepEqual(await map.listRoutes(), []);
+  const candidate = { id: 'relation/123', mode: 'bus', stops: [{ lat: 50.4, lon: 30.4 }, { lat: 50.42, lon: 30.43 }] };
+  for (const invalid of [{ ...candidate, id: 'relation/123);out;' }, { ...candidate, mode: 'bicycle' },
+    { ...candidate, stops: [{ lat: 49.8, lon: 24 }, { lat: 49.81, lon: 24.01 }] }]) {
+    assert.throws(() => map.rememberCandidateRoutes([invalid]), { code: 'INVALID_INPUT' });
+  }
+  map.rememberCandidateRoutes([candidate]);
+  assert.equal((await map.routeGeometry('relation/123')).id, 'relation/123');
+  assert.equal(queries.length, 2);
+  await assert.rejects(map.routeGeometry('relation/999'), { code: 'NOT_FOUND' });
+  time += 3_600_001;
+  await assert.rejects(map.routeGeometry('relation/123'), { code: 'NOT_FOUND' });
+  assert.equal(queries.length, 3);
+});
+
 test('only adjacent matching stop-position/platform pairs merge; platforms, unknowns and loop repeats retain order', async () => {
   const nodes = [];
   const members = [];

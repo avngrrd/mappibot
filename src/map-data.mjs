@@ -161,6 +161,26 @@ export function createMapData({
 } = {}) {
   const cache = new Map();
   const inflight = new Map();
+  const candidates = new Map();
+
+  // Server-internal handoff from the validated planner topology. A newly mapped
+  // route may not yet appear in the independent, hourly catalog cache. Keep only
+  // routes actually selected for a journey; clients cannot register arbitrary IDs.
+  function rememberCandidateRoutes(routes) {
+    if (!Array.isArray(routes) || routes.length > 6) throw fail('Некоректні маршрути поїздки.', 'INVALID_INPUT');
+    for (const route of routes) {
+      if (!ID.test(route?.id || '') || !Number.isSafeInteger(Number(route.id.slice(9))) || !MODES.test(route.mode || '')
+        || !Array.isArray(route.stops) || route.stops.length < 2 || route.stops.length > MAX_MEMBERS
+        || !route.stops.every(stop => stop && inside(stop.lat, stop.lon, UKRAINE))
+        || !route.stops.some(stop => inside(stop.lat, stop.lon, KYIV))) throw fail('Некоректний маршрут поїздки.', 'INVALID_INPUT');
+    }
+    for (const [id, expires] of candidates) if (expires <= now()) candidates.delete(id);
+    for (const route of routes) {
+      candidates.delete(route.id);
+      candidates.set(route.id, now() + TTL_MS);
+    }
+    while (candidates.size > 256) candidates.delete(candidates.keys().next().value);
+  }
 
   async function remember(key, load) {
     const cached = cache.get(key);
@@ -235,8 +255,11 @@ export function createMapData({
 
   async function routeGeometry(id) {
     if (typeof id !== 'string' || !ID.test(id) || !Number.isSafeInteger(Number(id.slice(9)))) throw fail('Некоректний ідентифікатор маршруту.', 'INVALID_INPUT');
-    const catalog = await listRoutes();
-    if (!catalog.some(route => route.id === id)) throw fail('Маршрут відсутній у каталозі Києва.', 'NOT_FOUND');
+    if (!(candidates.get(id) > now())) {
+      candidates.delete(id);
+      const catalog = await listRoutes();
+      if (!catalog.some(route => route.id === id)) throw fail('Маршрут відсутній у каталозі Києва.', 'NOT_FOUND');
+    }
     return remember(`geometry:${id}`, async () => {
       const osmId = id.slice(9);
       const query = `[out:json][timeout:25][maxsize:16777216];relation(${osmId})->.route;(.route;node(r.route);way(r.route);)->.all;.all out body geom;.all out count;`;
@@ -244,5 +267,5 @@ export function createMapData({
     });
   }
 
-  return { listRoutes, routeGeometry };
+  return { listRoutes, routeGeometry, rememberCandidateRoutes };
 }

@@ -107,7 +107,7 @@ if ($botAlive) {
         $env:MAP_URL_FILE = $mapUrlPath
         $env:MAP_URL = $null
         $env:STOP_FILE = $stopPath
-        $process = Start-Process -FilePath $nodeExecutable -ArgumentList ('"{0}"' -f $nodeEntry) -WorkingDirectory $repoDirectory -WindowStyle Hidden -PassThru -RedirectStandardOutput (Runtime-File 'bot.log') -RedirectStandardError (Runtime-File 'bot-error.log')
+        $process = Start-Process -FilePath $nodeExecutable -ArgumentList ('--env-file-if-exists=.env "{0}"' -f $nodeEntry) -WorkingDirectory $repoDirectory -WindowStyle Hidden -PassThru -RedirectStandardOutput (Runtime-File 'bot.log') -RedirectStandardError (Runtime-File 'bot-error.log')
         Set-Content -LiteralPath $pidPath -Value $process.Id -Encoding Ascii -NoNewline
         $botRecord = Get-CimInstance Win32_Process -Filter ('ProcessId = {0}' -f $process.Id) -ErrorAction SilentlyContinue
     } finally {
@@ -156,7 +156,7 @@ foreach ($provider in $providerAttempts) {
             $currentBot = Recorded-Process $pidPath
             $listeners = @(Get-NetTCPConnection -LocalPort 8787 -State Listen -ErrorAction SilentlyContinue)
             if (-not $currentBot -or $currentBot.ProcessId -ne $botRecord.ProcessId -or $currentBot.CreationDate -ne $botRecord.CreationDate -or -not (Has-Argument $currentBot $nodeEntry) -or $listeners.Count -eq 0 -or @($listeners | Where-Object { $_.OwningProcess -ne $botRecord.ProcessId -or $_.LocalAddress -ne '127.0.0.1' }).Count -gt 0) { throw 'The map origin changed during setup.' }
-            $privateNames = @('TELEGRAM_BOT_TOKEN', 'INVITE_CODE', 'MAP_PREVIEW_KEY')
+            $privateNames = @('TELEGRAM_BOT_TOKEN', 'INVITE_CODE', 'MAP_PREVIEW_KEY', 'EASYWAY_LOGIN', 'EASYWAY_PASSWORD')
             $previousPrivate = @{}
             foreach ($name in $privateNames) { $previousPrivate[$name] = [Environment]::GetEnvironmentVariable($name, 'Process'); [Environment]::SetEnvironmentVariable($name, $null, 'Process') }
             try {

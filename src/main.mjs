@@ -8,6 +8,9 @@ import { createKyivProvider } from './kyiv.mjs';
 import { createMapData } from './map-data.mjs';
 import { createMapServer } from './map-server.mjs';
 import { readMapUrl } from './tunnel-url.mjs';
+import { createPlanner } from './planner.mjs';
+import { createKyivSchedules } from './kyiv-schedules.mjs';
+import { createEasyWay } from './easyway.mjs';
 
 let release;
 let mapServer;
@@ -50,10 +53,15 @@ try {
   };
   const mapPort = Number(process.env.MAP_PORT || 8787);
   if (!Number.isInteger(mapPort) || mapPort < 1 || mapPort > 65535) throw new Error('Invalid MAP_PORT');
+  const sourceOptions = { overpassUrl: process.env.OVERPASS_URL || undefined,
+    userAgent: process.env.USER_AGENT || 'MappiBot/0.1 (https://github.com/avngrrd/mappibot)' };
+  const mapData = createMapData(sourceOptions);
   mapServer = createMapServer({
     botToken: process.env.TELEGRAM_BOT_TOKEN, previewKey: process.env.MAP_PREVIEW_KEY || '', store, allowedUserIds, providers,
-    mapData: createMapData({ overpassUrl: process.env.OVERPASS_URL || undefined,
-      userAgent: process.env.USER_AGENT || 'MappiBot/0.1 (https://github.com/avngrrd/mappibot)' })
+    mapData,
+    planner: createPlanner({ ...sourceOptions, mapData }),
+    schedules: createKyivSchedules(sourceOptions),
+    easyway: createEasyWay({ login: process.env.EASYWAY_LOGIN, password: process.env.EASYWAY_PASSWORD, userAgent: sourceOptions.userAgent })
   });
   await new Promise((resolve, reject) => { mapServer.once('error', reject); mapServer.listen(mapPort, '127.0.0.1', resolve); });
   await syncMapUrl();
@@ -67,6 +75,8 @@ try {
   await telegram.call('setMyCommands', { commands: [
     { command: 'start', description: 'Головне меню' },
     { command: 'map', description: 'Карта Києва: транспорт і маршрути' },
+    { command: 'trip', description: 'Побудувати поїздку на карті' },
+    { command: 'schedule', description: 'Розклади метро, електрички й фунікулера' },
     { command: 'city', description: 'Знайти місто або місце' },
     { command: 'favorites', description: 'Обрані зупинки' },
     { command: 'live', description: 'GPS Києва: експериментальне покриття' },

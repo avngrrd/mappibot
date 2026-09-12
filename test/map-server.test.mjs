@@ -184,3 +184,208 @@ test('auth rejects oversized bodies and wrong media type without creating a sess
   const oversized = await app.request('/api/auth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ initData: 'x'.repeat(24_001) }) });
   assert.equal(oversized.status, 413);
 });
+
+const JOURNEY = {
+  from: { lat: 50.45, lon: 30.52 }, to: { lat: 50.46, lon: 30.53 },
+  modes: ['bus', 'subway'], maxTransfers: 1, sort: 'transfers',
+};
+const STATION = { id: 'mr10_119', name: 'Театральна', lat: 50.445, lon: 30.518, line: 'Святошинсько-Броварська' };
+const SCHEDULE_CATALOG = {
+  systems: [
+    { id: 'metro', name: 'Метро', stations: [STATION] },
+    { id: 'rail', name: 'Міська електричка', stations: [{ id: 'rail01', name: 'Вокзальна', lat: 50.44, lon: 30.49 }] },
+    { id: 'funicular', name: 'Фунікулер', stations: [{ id: 'fn01', name: 'Верхня', lat: 50.456, lon: 30.522 }] },
+  ], source: 'Official test source', fetchedAt: new Date(NOW).toISOString(),
+};
+const postJson = (token, body) => ({ token, method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
+test('all new APIs require a live bearer before reading inputs or calling services', async context => {
+  const calls = [];
+  const app = await setup(context, {
+    providers: { async stopRoutes() { calls.push('stopRoutes'); return []; } },
+    serverOptions: {
+      planner: { async plan() { calls.push('plan'); return {}; } },
+      schedules: {
+        async catalog() { calls.push('catalog'); return SCHEDULE_CATALOG; },
+        async timetable() { calls.push('timetable'); return {}; },
+      },
+      easyway: { configured: true, async status() { calls.push('easyway'); return {}; } },
+    },
+  });
+  const endpoints = [
+    ['/api/capabilities', {}],
+    ['/api/journeys', postJson(undefined, JOURNEY)],
+    ['/api/stop-routes', postJson(undefined, { stop: { id: 'node/1', osmIds: ['node/1', 'way/2'] } })],
+    ['/api/schedules/catalog', {}],
+    ['/api/schedules?system=metro&station=mr10_119', {}],
+  ];
+  for (const [pathname, init] of endpoints) {
+    const response = await app.request(pathname, { ...init, headers: { ...init.headers, 'X-Forwarded-For': '127.0.0.1', 'X-User-Id': String(USER_ID) } });
+    assert.equal(response.status, 401, pathname);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+  }
+  const { body: { token } } = await app.auth();
+  app.setTime(NOW + 4 * 3_600_000 + 1);
+  for (const [pathname, init] of endpoints) assert.equal((await app.request(pathname, { ...init, token })).status, 401, pathname);
+  assert.deepEqual(calls, []);
+});
+
+test('journey API forwards only validated coordinates and deduplicated supported modes', async context => {
+  const calls = [], result = { plans: [], source: 'Test topology', notice: 'No arrival forecast' };
+  const app = await setup(context, { serverOptions: { planner: { async plan(query) { calls.push(query); return result; } } } });
+  const { body: { token } } = await app.auth();
+  const response = await app.request('/api/journeys', postJson(token, {
+    ...JOURNEY,
+    from: { ...JOURNEY.from, name: 'Private address', url: 'https://untrusted.invalid/' },
+    to: { ...JOURNEY.to, token: 'PRIVATE_VALUE' },
+    modes: ['bus', 'subway', 'bus'], url: 'https://untrusted.invalid/', login: 'PRIVATE_VALUE',
+  }));
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), result);
+  assert.deepEqual(calls, [JOURNEY]);
+  const boundary = {
+    from: { lat: 50.2, lon: 30.2 }, to: { lat: 50.7, lon: 30.9 },
+    modes: ['bus', 'trolleybus', 'tram', 'subway', 'light_rail'], maxTransfers: 0, sort: 'walk',
+  };
+  assert.equal((await app.request('/api/journeys', postJson(token, boundary))).status, 200);
+  assert.deepEqual(calls[1], boundary);
+  assert.equal((await app.request('/api/journeys', { token })).status, 405);
+  assert.equal(calls.length, 2);
+});
+
+test('journey API rejects malformed, out-of-city and unsupported requests before planning', async context => {
+  let planned = 0;
+  const app = await setup(context, { serverOptions: { planner: { async plan() { planned++; return {}; } } } });
+  const { body: { token } } = await app.auth();
+  const invalid = [
+    null, [], {}, { ...JOURNEY, from: null }, { ...JOURNEY, to: [] },
+    ...[
+      { lat: '50.45', lon: 30.52 }, { lat: null, lon: 30.52 }, { lat: 50.45 },
+      { lat: 50.1999, lon: 30.52 }, { lat: 50.7001, lon: 30.52 },
+      { lat: 50.45, lon: 30.1999 }, { lat: 50.45, lon: 30.9001 },
+      { lat: 49.84, lon: 24.03 },
+    ].flatMap(point => [{ ...JOURNEY, from: point }, { ...JOURNEY, to: point }]),
+    ...[null, [], 'bus', ['train'], ['bus', 'foot'], [null], Array(6).fill('bus')].map(modes => ({ ...JOURNEY, modes })),
+    ...[-1, 2, '1', null, true].map(maxTransfers => ({ ...JOURNEY, maxTransfers })),
+    ...['fastest', '', null, []].map(sort => ({ ...JOURNEY, sort })),
+  ];
+  for (const body of invalid) assert.equal((await app.request('/api/journeys', postJson(token, body))).status, 400, JSON.stringify(body));
+  // Valid JSON can encode a number outside JavaScript's finite range.
+  const infinite = await app.request('/api/journeys', { ...postJson(token, JOURNEY), body: JSON.stringify(JOURNEY).replace('50.45', '1e999') });
+  assert.equal(infinite.status, 400);
+  const malformed = await app.request('/api/journeys', { ...postJson(token, {}), body: '{' });
+  assert.equal(malformed.status, 400);
+  assert.equal((await app.request('/api/journeys', { ...postJson(token, {}), headers: { 'Content-Type': 'text/plain' } })).status, 415);
+  assert.equal((await app.request('/api/journeys', postJson(token, { ...JOURNEY, extra: 'x'.repeat(24_001) }))).status, 413);
+  assert.equal(planned, 0);
+});
+
+test('POST stop-routes preserves merged OSM platform IDs while blocking query injection and oversized sets', async context => {
+  const calls = [];
+  const app = await setup(context, { providers: { async stopRoutes(stop) { calls.push(stop); return [ROUTE]; } } });
+  const { body: { token } } = await app.auth();
+  const stop = { id: 'node/1', osmIds: ['node/1', 'node/2', 'way/3', 'relation/4'] };
+  const response = await app.request('/api/stop-routes', postJson(token, { stop: { ...stop, name: 'Private place', lat: 50.45, lon: 30.52 }, url: 'https://untrusted.invalid/' }));
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { routes: [ROUTE] });
+  assert.deepEqual(calls, [stop]);
+  assert.equal((await app.request('/api/stop-routes', postJson(token, { stop: { id: 'way/5' } }))).status, 200);
+  assert.deepEqual(calls[1], { id: 'way/5' });
+  const invalidIds = [1, '', 'node/0', 'node/-1', 'node/1);out;', 'node/1000000000000000', 'https://example.org/node/1', 'relation/1\n'];
+  for (const id of invalidIds) {
+    assert.equal((await app.request('/api/stop-routes', postJson(token, { stop: { id } }))).status, 400);
+    assert.equal((await app.request('/api/stop-routes', postJson(token, { stop: { id: 'node/1', osmIds: [id] } }))).status, 400);
+  }
+  for (const osmIds of [null, 'node/1', {}, Array(21).fill('node/1')]) {
+    assert.equal((await app.request('/api/stop-routes', postJson(token, { stop: { id: 'node/1', osmIds } }))).status, 400);
+  }
+  assert.equal((await app.request('/api/stop-routes', postJson(token, {}))).status, 400);
+  assert.equal((await app.request('/api/stop-routes', { token })).status, 405);
+  assert.equal(calls.length, 2);
+});
+
+test('schedule API restricts station IDs to the chosen catalog and never forwards arbitrary upstream URLs', async context => {
+  const calls = [];
+  const result = {
+    system: 'metro', station: STATION,
+    directions: [{ id: 'forward', name: 'Прямий', first: '05:48', last: '23:05', intervals: [{ days: 'Робочі дні', period: '05:30–07:00', minutes: null, label: '7:30-5:30 хв:сек' }] }],
+    source: SCHEDULE_CATALOG.source, fetchedAt: SCHEDULE_CATALOG.fetchedAt, notice: 'Опублікований розклад, не прогноз прибуття.',
+  };
+  const app = await setup(context, { serverOptions: { schedules: {
+    async catalog() { calls.push(['catalog']); return SCHEDULE_CATALOG; },
+    async timetable(...args) { calls.push(['timetable', ...args]); return result; },
+  } } });
+  const { body: { token } } = await app.auth();
+  const catalog = await app.request('/api/schedules/catalog', { token });
+  assert.equal(catalog.status, 200);
+  assert.deepEqual(await catalog.json(), SCHEDULE_CATALOG);
+  const timetable = await app.request('/api/schedules?system=metro&station=mr10_119&url=https%3A%2F%2Funtrusted.invalid%2F&layer=99', { token });
+  assert.equal(timetable.status, 200);
+  assert.deepEqual(await timetable.json(), result);
+  assert.deepEqual(calls, [['catalog'], ['catalog'], ['timetable', 'metro', 'mr10_119']]);
+  // Valid-looking IDs may only be used with the system that actually owns them.
+  for (const query of ['system=metro&station=rail01', 'system=rail&station=mr10_119', 'system=funicular&station=unknown']) {
+    assert.equal((await app.request('/api/schedules?' + query, { token })).status, 400);
+  }
+  const beforeMalformed = calls.length;
+  for (const query of [
+    '', 'system=bus&station=mr10_119', 'system=metro', 'system=metro&station=..%2F13%2Fquery',
+    'system=metro&station=https%3A%2F%2Funtrusted.invalid', 'system=metro&station=mr10_119%27%20OR%201%3D1',
+    'system=metro&station=' + 'a'.repeat(41),
+  ]) assert.equal((await app.request('/api/schedules?' + query, { token })).status, 400);
+  assert.equal(calls.length, beforeMalformed, 'malformed IDs must not fetch even the catalog');
+  assert.equal(calls.filter(([name]) => name === 'timetable').length, 1);
+  assert.equal((await app.request('/api/schedules/catalog', postJson(token, {}))).status, 405);
+  assert.equal((await app.request('/api/schedules?system=metro&station=mr10_119', postJson(token, {}))).status, 405);
+});
+
+test('capabilities never expose EasyWay credentials, permissions or an unverified connected state', async context => {
+  const marker = 'PRIVATE_EASYWAY_CREDENTIAL_OR_ACCOUNT_PAYLOAD';
+  let checked = 0;
+  const app = await setup(context, { serverOptions: {
+    planner: { plan() {} }, schedules: { catalog() {}, timetable() {} },
+    easyway: { configured: true, connected: true, login: marker, password: marker, permissions: marker,
+      status() { checked++; throw new Error(marker); } },
+  } });
+  const { body: { token } } = await app.auth();
+  const response = await app.request('/api/capabilities', { token });
+  assert.equal(response.status, 200);
+  const text = await response.text(), data = JSON.parse(text);
+  assert.equal(data.journeys, true);
+  assert.equal(data.schedules, true);
+  assert.equal(data.easyway.configured, true);
+  assert.equal(data.easyway.connected, false);
+  assert.deepEqual(Object.keys(data.easyway).sort(), ['configured', 'connected', 'notice']);
+  for (const secret of [marker, BOT_TOKEN, PREVIEW_KEY, token]) assert.ok(!text.includes(secret));
+  assert.equal(checked, 0, 'capability reads must not perform credential checks or consume account quota');
+
+  const unavailable = await setup(context);
+  const { body: { token: secondToken } } = await unavailable.auth();
+  const absent = await unavailable.request('/api/capabilities', { token: secondToken });
+  const disabled = await absent.json();
+  assert.equal(disabled.journeys, false);
+  assert.equal(disabled.schedules, false);
+  assert.equal(disabled.easyway.configured, false);
+  assert.equal(disabled.easyway.connected, false);
+  assert.equal((await unavailable.request('/api/journeys', postJson(secondToken, JOURNEY))).status, 503);
+  assert.equal((await unavailable.request('/api/schedules/catalog', { token: secondToken })).status, 503);
+  assert.equal((await unavailable.request('/api/schedules?system=metro&station=mr10_119', { token: secondToken })).status, 503);
+});
+
+test('new service failures return controlled errors without exposing provider requests or private points', async context => {
+  const marker = 'PRIVATE_PROVIDER_REQUEST_OR_LOCATION';
+  const fail = async () => { throw new Error(`https://upstream.invalid/?password=${marker}`); };
+  const app = await setup(context, { providers: { stopRoutes: fail }, serverOptions: {
+    planner: { plan: fail }, schedules: { catalog: async () => SCHEDULE_CATALOG, timetable: fail },
+  } });
+  const { body: { token } } = await app.auth();
+  for (const [pathname, init] of [
+    ['/api/journeys', postJson(token, JOURNEY)],
+    ['/api/stop-routes', postJson(token, { stop: { id: 'node/1' } })],
+    ['/api/schedules?system=metro&station=mr10_119', { token }],
+  ]) {
+    const response = await app.request(pathname, init);
+    assert.equal(response.status, 503, pathname);
+    assert.deepEqual(await response.json(), { error: 'Джерело даних зараз недоступне. Спробуйте ще раз.' });
+  }
+});

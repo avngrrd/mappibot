@@ -9,6 +9,7 @@ const MAX_FAVORITES = 20;
 const MENU = {
   keyboard: [
     [{ text: '🗺 Карта Києва' }],
+    [{ text: '↔️ Спланувати поїздку' }, { text: '🕒 Розклади' }],
     [{ text: '📍 Зупинки поруч', request_location: true }],
     [{ text: '🔎 Пошук місця' }, { text: '⭐ Обране' }],
     [{ text: '🚌 GPS Київ' }, { text: 'ℹ️ Покриття' }],
@@ -107,14 +108,24 @@ export function createBot({ telegram, providers, store, inviteCode, allowedUserI
 
   async function menu(chatId) {
     if (getMapUrl()) await showMap(chatId);
-    return send(chatId, '🇺🇦 Маппі — транспорт поруч. Основне місто — Київ.\n\nНадішліть геолокацію або назву місця в Києві, наприклад «Контрактова площа». Покажу найближчі зупинки. Для іншого міста вкажіть його через кому або використайте /city.\n\n/city вокзал, Львів — пошук по Україні\n/favorites — обране\n/live — експериментальний GPS Києва\n/live 104 — фільтр маршруту\n/coverage — покриття\n/forget — видалити мої збережені дані\n/id — мій Telegram ID\n\nКоординати не зберігаю на диску. Зупинка потрапляє до обраного лише за вашим натисканням. Тимчасові результати доступні до 15 хвилин.', { reply_markup: MENU });
+    return send(chatId, '🇺🇦 Маппі — транспорт поруч. Основне місто — Київ.\n\nНадішліть геолокацію або назву місця в Києві, наприклад «Контрактова площа». Покажу найближчі зупинки. Для іншого міста вкажіть його через кому або використайте /city.\n\n/map — карта Києва\n/trip — спланувати поїздку A → B\n/schedule — опубліковані розклади\n/city вокзал, Львів — пошук по Україні\n/favorites — обране\n/live — експериментальний GPS Києва\n/live 104 — фільтр маршруту\n/coverage — покриття\n/forget — видалити мої збережені дані\n/id — мій Telegram ID\n\nКоординати не зберігаю на диску. Зупинка потрапляє до обраного лише за вашим натисканням. Тимчасові результати доступні до 15 хвилин.', { reply_markup: MENU });
   }
 
-  async function showMap(chatId) {
-    const url = getMapUrl();
+  async function showMap(chatId, panel = null) {
+    let url = getMapUrl();
     if (!url) return send(chatId, 'Карта запускається на ПК. Спробуйте /map за кілька секунд.');
-    return send(chatId, '🗺 Карта Києва: транспорт, маршрути й зупинки. GPS охоплює лише частину міського транспорту.', {
-      reply_markup: { inline_keyboard: [[{ text: '🗺 Відкрити карту', web_app: { url } }]] }
+    const features = {
+      'journeys-panel': { text: '↔️ Сплануйте поїздку: оберіть точки A та B, види транспорту й варіант із пересадкою або без неї.', button: '↔️ Спланувати поїздку' },
+      'schedules-panel': { text: '🕒 Опубліковані розклади Києва. Вони можуть відрізнятися від фактичного руху через затримки та оперативні зміни.', button: '🕒 Відкрити розклади' },
+    };
+    const feature = features[panel];
+    if (feature) {
+      const target = new URL(url);
+      target.hash = new URLSearchParams({ panel }).toString();
+      url = target.toString();
+    }
+    return send(chatId, feature?.text || '🗺 Карта Києва: транспорт, маршрути й зупинки. GPS охоплює лише частину міського транспорту.', {
+      reply_markup: { inline_keyboard: [[{ text: feature?.button || '🗺 Відкрити карту', web_app: { url } }]] }
     });
   }
 
@@ -282,6 +293,8 @@ export function createBot({ telegram, providers, store, inviteCode, allowedUserI
       }
       if (command?.name === 'help') return await menu(chatId);
       if (command?.name === 'map' || value === '🗺 Карта Києва') return await showMap(chatId);
+      if (command?.name === 'trip' || value === '↔️ Спланувати поїздку') return await showMap(chatId, 'journeys-panel');
+      if (command?.name === 'schedule' || value === '🕒 Розклади') return await showMap(chatId, 'schedules-panel');
       if (command?.name === 'coverage' || value === 'ℹ️ Покриття') return await send(chatId, COVERAGE);
       if (command?.name === 'favorites' || value === '⭐ Обране') return await favorites(id, chatId);
       if (command?.name === 'live' || value === '🚌 GPS Київ') return await live(id, chatId, command?.args ?? '');

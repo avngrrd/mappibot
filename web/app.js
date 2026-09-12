@@ -4,22 +4,29 @@
 
   // Runs before the third-party Telegram SDK. Preview credentials leave the URL
   // immediately and stay only in this closure until the authentication request.
-  let previewKey = new URLSearchParams(location.hash.slice(1)).get('preview');
+  const initialFragment = new URLSearchParams(location.hash.slice(1));
+  let previewKey = initialFragment.get('preview');
+  let requestedPanel = initialFragment.get('panel');
   if (previewKey !== null) history.replaceState(null, '', location.pathname + location.search);
 
   const SESSION_KEY = 'mappi.session.v1';
-  const FAVORITES_KEY = 'mappi.savedStops.v1';
+  const FAVORITES_KEY = 'mappi.favorites.v2';
+  const OLD_FAVORITES_KEY = 'mappi.savedStops.v1';
+  const SETTINGS_KEY = 'mappi.mapSettings.v1';
   const MAX_AGE_MS = 180_000;
   const KYIV_BOUNDS = [[50.335, 30.345], [50.585, 30.705]];
   const SOURCE_URL = 'https://data.kyivcity.gov.ua/dataset/dani-pro-mistseznakhodzhennia-miskoho-elektrychnoho-ta-pasazhyrskoho-avtomobilnoho-tra-dep-transport';
-  const MODE_NAMES = { bus: 'Автобус', trolleybus: 'Тролейбус', tram: 'Трамвай', subway: 'Метро', train: 'Поїзд', unknown: 'Транспорт' };
-  const MODE_COLORS = { bus: '#16aaa4', trolleybus: '#477fc0', tram: '#9465bf', subway: '#dc7e46', unknown: '#537c97' };
+  const MODE_NAMES = { bus: 'Автобус', trolleybus: 'Тролейбус', tram: 'Трамвай', subway: 'Метро', light_rail: 'Легкорейковий', train: 'Поїзд', unknown: 'Інший тип' };
+  const MODE_COLORS = { bus: '#16aaa4', trolleybus: '#477fc0', tram: '#9465bf', subway: '#dc7e46', light_rail: '#9b6fb1', unknown: '#537c97' };
   const state = {
     token: null, map: null, tg: null, activeTab: 'map-panel', vehicles: [], markers: new Map(),
     liveBusy: false, liveFailed: false, fetchedAt: null, routes: null, routesBusy: false,
-    mode: 'all', selectedRoute: null, routeSequence: 0, nearbySequence: 0, searchSequence: 0,
-    favorites: [], routeLayer: null, stopsLayer: null, placeLayer: null, locationLayer: null,
-    activeStop: null, toastTimer: null,
+    catalogMode: 'all', selectedRoute: null, routeSequence: 0, nearbySequence: 0, searchSequence: 0,
+    favorites: [], favoriteRoutes: [], favoriteTab: 'stops', stopsLayer: null, placeLayer: null, locationLayer: null,
+    activeRoutes: new Map(), routeReturnTab: 'routes-panel', routePromise: null, panels: new Map(),
+    settings: { gps: true, stops: true, lines: true, modes: Object.keys(MODE_NAMES) },
+    stopRouteCache: new Map(), stopRoutePending: new Map(),
+    activeStop: null, selectedPoint: null, openPopup: null, toastTimer: null,
   };
   const $ = (id) => document.getElementById(id);
   const clean = (value, limit = 180) => String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, limit);
@@ -91,7 +98,24 @@
     state.toastTimer = setTimeout(() => { $('toast').hidden = true; }, 5000);
   }
   class ApiError extends Error {
-    constructor(status) { super('Request failed'); this.status = status; }
+    constructor(status) {
+      const messages = {
+        0: 'Не вдалося отримати відповідь. Перевірте інтернет і спробуйте ще раз.',
+        400: 'Перевірте введені дані й спробуйте ще раз.',
+        401: 'Сеанс завершився. Відкрийте карту знову через Telegram-бота.',
+        403: 'Немає доступу. Відкрийте карту через приватного Telegram-бота.',
+        404: 'Ці дані не знайдено. Спробуйте інший маршрут або місце.',
+        413: 'Запит завеликий. Спробуйте меншу ділянку карти.',
+        422: 'Не вдалося обробити ці дані. Спробуйте інші точки або маршрут.',
+        429: 'Забагато запитів. Зачекайте трохи й спробуйте ще раз.',
+        502: 'Джерело тимчасово недоступне. Спробуйте пізніше.',
+        503: 'Сервіс тимчасово недоступний. Спробуйте пізніше.',
+        504: 'Джерело відповідає надто довго. Спробуйте ще раз.',
+      };
+      super(messages[status] || 'Не вдалося завантажити дані. Спробуйте ще раз трохи пізніше.');
+      this.name = 'ApiError';
+      this.status = status;
+    }
   }
   function clearSession() {
     state.token = null;
@@ -104,6 +128,7 @@
     $('application').hidden = true;
   }
   async function api(path, options = {}) {
+    if (typeof path !== 'string' || !path.startsWith('/api/') || path.startsWith('//')) throw new ApiError(400);
     const headers = { Accept: 'application/json' };
     if (state.token) headers.Authorization = `Bearer ${state.token}`;
     if (options.body) headers['Content-Type'] = 'application/json';
@@ -111,8 +136,8 @@
     try {
       response = await fetch(path, {
         method: options.method || 'GET', headers,
-        ...(options.body ? { body: JSON.stringify(options.body) } : {}),
-        signal: AbortSignal.timeout(25_000), cache: 'no-store', redirect: 'error',
+        ...(options.body ? { body: typeof options.body === 'string' ? options.body : JSON.stringify(options.body) } : {}),
+        signal: AbortSignal.timeout(Math.max(1000, Math.min(90_000, Number(options.timeoutMs) || 25_000))), cache: 'no-store', redirect: 'error',
       });
     } catch { throw new ApiError(0); }
     if (!response.ok) {
@@ -148,13 +173,17 @@
     document.documentElement.style.setProperty('--tg-safe-top', `${Math.min(top, 150)}px`);
     document.documentElement.style.setProperty('--tg-safe-bottom', `${Math.min(bottom, 100)}px`);
     state.map?.invalidateSize();
+    updatePopupLayout(state.openPopup);
   }
   function setExpanded(expanded) {
+    if (expanded) state.map?.closePopup();
     $('sheet').classList.toggle('is-collapsed', !expanded);
     $('sheet-toggle').setAttribute('aria-expanded', String(expanded));
     $('sheet-toggle').setAttribute('aria-label', expanded ? 'Згорнути панель' : 'Розгорнути панель');
   }
   function switchTab(id, expand = true) {
+    if (!$(id)) return false;
+    if (id !== 'routes-panel' && id !== state.activeTab) state.routeSequence++;
     state.activeTab = id;
     for (const tab of document.querySelectorAll('.tab')) {
       const selected = tab.dataset.tab === id;
@@ -164,13 +193,117 @@
     for (const panel of document.querySelectorAll('.panel')) panel.hidden = panel.id !== id;
     const headings = {
       'map-panel': ['КИЇВ · ЗАРАЗ', 'Транспорт на карті'], 'routes-panel': ['КИЇВ · МАРШРУТИ', 'Оберіть свій маршрут'],
-      'search-panel': ['УКРАЇНА · ПОШУК', 'Знайдіть місце'], 'favorites-panel': ['НА ЦЬОМУ ПРИСТРОЇ', 'Обрані зупинки'],
+      'search-panel': ['УКРАЇНА · ПОШУК', 'Знайдіть місце'], 'favorites-panel': ['НА ЦЬОМУ ПРИСТРОЇ', 'Ваше обране'],
     };
-    $('sheet-kicker').textContent = headings[id][0];
-    $('sheet-title').textContent = headings[id][1];
+    const registered = state.panels.get(id);
+    const heading = headings[id] || [registered?.kicker || 'MAPPI', registered?.title || registered?.label || 'Карта'];
+    $('sheet-kicker').textContent = heading[0];
+    $('sheet-title').textContent = heading[1];
     setExpanded(expand);
     if (id === 'routes-panel' && !state.routes) loadRoutes();
     if (id === 'favorites-panel') renderFavorites();
+    if (registered?.onOpen) Promise.resolve().then(() => registered.onOpen()).catch(() => toast('Не вдалося відкрити розділ. Спробуйте ще раз.'));
+    window.dispatchEvent(new CustomEvent('mappi:panel-change', { detail: { id } }));
+    return true;
+  }
+  function registerPanel({ id, label, title, kicker, content, onOpen }) {
+    if (!/^[a-z][a-z0-9-]{1,60}$/.test(id) || state.panels.has(id) || $(id) || !(content instanceof Node)) return false;
+    const panel = node('section', 'panel');
+    panel.id = id; panel.hidden = true; panel.setAttribute('aria-label', clean(title || label));
+    panel.append(content);
+    document.querySelector('.sheet-content').append(panel);
+    const tab = button('', 'tab', () => switchTab(id));
+    tab.dataset.tab = id;
+    const symbol = node('span', 'tab-symbol', id.includes('schedule') ? '◷' : '⇄');
+    symbol.setAttribute('aria-hidden', 'true');
+    tab.append(symbol, node('span', '', clean(label, 22)));
+    document.querySelector('.tabbar').append(tab);
+    state.panels.set(id, { label, title, kicker, onOpen });
+    document.documentElement.style.setProperty('--tab-count', String(document.querySelectorAll('.tab').length));
+    if (requestedPanel === id) { requestedPanel = null; queueMicrotask(() => switchTab(id)); }
+    return true;
+  }
+  function publishBridge() {
+    window.Mappi = Object.freeze({
+      api, map: state.map, registerPanel,
+      showPanel: (id) => switchTab(id),
+      fitBounds: (bounds) => fitPoints(bounds?.isValid ? bounds : L.latLngBounds(bounds)),
+      focusMap: (bounds) => {
+        setExpanded(false);
+        fitPoints(bounds?.isValid ? bounds : L.latLngBounds(bounds));
+      },
+      showStop,
+      clearMap: () => {
+        clearRoute();
+        state.nearbySequence++; $('nearby').disabled = false;
+        state.stopsLayer.clearLayers(); state.placeLayer.clearLayers();
+      },
+      getSelectedPoint: () => {
+        const point = state.selectedPoint || state.activeStop;
+        if (point) return { name: clean(point.name || 'Обрана точка'), lat: point.lat, lon: point.lon };
+        const center = state.map.getCenter();
+        return { name: 'Центр карти', lat: center.lat, lon: center.lng };
+      },
+    });
+    window.dispatchEvent(new CustomEvent('mappi:ready', { detail: window.Mappi }));
+  }
+  function planPoint(kind, point) {
+    if (!validPosition(point)) return;
+    state.selectedPoint = { name: clean(point.name || 'Точка на карті'), lat: point.lat, lon: point.lon };
+    state.map.closePopup();
+    window.dispatchEvent(new CustomEvent('mappi:plan-point', { detail: { kind, point: { ...state.selectedPoint } } }));
+  }
+  function pointActions(point) {
+    const actions = node('div', 'point-actions');
+    actions.append(button('A · Звідси', 'button button-secondary', () => planPoint('from', point)),
+      button('B · Сюди', 'button button-secondary', () => planPoint('to', point)));
+    return actions;
+  }
+  function pointPopup(point) {
+    const box = node('div', 'map-popup');
+    box.append(node('h3', '', clean(point.name || 'Точка на карті')), pointActions(point));
+    return box;
+  }
+  function readSettings() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null');
+      if (!saved || typeof saved !== 'object') return;
+      for (const key of ['gps', 'lines', 'stops']) if (typeof saved[key] === 'boolean') state.settings[key] = saved[key];
+      if (Array.isArray(saved.modes)) state.settings.modes = [...new Set(saved.modes.filter((mode) => Object.hasOwn(MODE_NAMES, mode)))];
+    } catch { /* Defaults still allow the map to work. */ }
+  }
+  function persistSettings() {
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); }
+    catch { toast('Налаштування працюють у цьому сеансі; браузер не дозволив їх зберегти.'); }
+  }
+  function setLayerVisible(layer, visible) {
+    if (!layer || !state.map) return;
+    if (visible && !state.map.hasLayer(layer)) layer.addTo(state.map);
+    if (!visible && state.map.hasLayer(layer)) state.map.removeLayer(layer);
+  }
+  function applyMapSettings() {
+    for (const key of ['gps', 'lines', 'stops']) $( `toggle-${key}` ).checked = state.settings[key];
+    setLayerVisible(state.stopsLayer, state.settings.stops);
+    for (const entry of state.activeRoutes.values()) {
+      setLayerVisible(entry.lines, state.settings.lines);
+      setLayerVisible(entry.stops, state.settings.stops);
+    }
+    renderMapModeFilters();
+    renderVehicles();
+  }
+  function renderMapModeFilters() {
+    const fragment = document.createDocumentFragment();
+    for (const [mode, name] of Object.entries(MODE_NAMES)) {
+      if (mode === 'train') continue;
+      const active = state.settings.modes.includes(mode);
+      const chip = button(name, `map-mode-chip mode-${mode}${active ? ' is-active' : ''}`, () => {
+        state.settings.modes = active ? state.settings.modes.filter((item) => item !== mode) : [...state.settings.modes, mode];
+        persistSettings(); applyMapSettings();
+      });
+      chip.setAttribute('aria-pressed', String(active));
+      fragment.append(chip);
+    }
+    $('map-mode-filters').replaceChildren(fragment);
   }
   function fitPoints(bounds, zoom = 16) {
     if (!bounds?.isValid()) return;
@@ -185,14 +318,41 @@
     if (!validPosition(point)) return;
     fitPoints(L.latLngBounds([[point.lat, point.lon]]), zoom);
   }
+  function popupOptions() {
+    const rect = $('map').getBoundingClientRect();
+    const header = document.querySelector('.topbar').getBoundingClientRect();
+    const routeChip = $('route-map-label');
+    const sheet = $('sheet').getBoundingClientRect();
+    const desktop = window.innerWidth >= 650;
+    const left = desktop ? Math.ceil(sheet.right - rect.left + 15) : 15;
+    const top = Math.ceil(Math.max(170, header.bottom - rect.top + 102,
+      routeChip.hidden ? 0 : routeChip.getBoundingClientRect().bottom - rect.top + 12));
+    const bottom = desktop ? 20 : Math.ceil(Math.max(20, rect.bottom - sheet.top + 20));
+    return {
+      autoPan: true,
+      autoPanPaddingTopLeft: [left, top],
+      autoPanPaddingBottomRight: [65, bottom],
+      maxWidth: Math.max(80, Math.min(260, rect.width - left - 65 - 34)),
+      // Leaflet adds content margins, the wrapper and a tip outside maxHeight.
+      // Constrain the entire card, including actions and asynchronously added routes.
+      maxHeight: Math.max(40, Math.min(360, rect.height - top - bottom - 56)),
+    };
+  }
+  function updatePopupLayout(popup) {
+    if (!popup?.isOpen()) return;
+    Object.assign(popup.options, popupOptions());
+    popup.getElement()?.style.setProperty('--mappi-popup-min-width', `${Math.min(205, popup.options.maxWidth)}px`);
+    popup.update();
+  }
   function initializeMap() {
+    // Feature panels also create Leaflet popups, so they share these defaults.
+    L.Popup.mergeOptions({ maxWidth: 260, maxHeight: 360, autoPanPaddingTopLeft: [15, 170], autoPanPaddingBottomRight: [65, 190] });
     state.map = L.map('map', { zoomControl: false, attributionControl: false, minZoom: 5, maxZoom: 19, preferCanvas: true });
     L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>',
       updateWhenIdle: true, keepBuffer: 2,
     }).addTo(state.map);
     L.control.attribution({ prefix: false, position: 'bottomright' }).addTo(state.map);
-    state.routeLayer = L.featureGroup().addTo(state.map);
     state.stopsLayer = L.featureGroup().addTo(state.map);
     state.placeLayer = L.featureGroup().addTo(state.map);
     state.locationLayer = L.featureGroup().addTo(state.map);
@@ -200,17 +360,31 @@
     new ResizeObserver(() => {
       document.documentElement.style.setProperty('--sheet-size', `${Math.round($('sheet').getBoundingClientRect().height)}px`);
     }).observe($('sheet'));
-    state.map.on('popupopen', () => updateAges());
+    state.map.on('popupopen', ({ popup }) => {
+      setExpanded(false);
+      state.openPopup = popup;
+      updatePopupLayout(popup);
+      updateAges();
+    });
+    state.map.on('popupclose', ({ popup }) => { if (state.openPopup === popup) state.openPopup = null; });
+    state.map.on('click', (event) => {
+      const point = { name: 'Точка на карті', lat: event.latlng.lat, lon: event.latlng.lng };
+      state.selectedPoint = point;
+      L.popup(popupOptions()).setLatLng(event.latlng).setContent(pointPopup(point)).openOn(state.map);
+    });
     $('zoom-in').addEventListener('click', () => state.map.zoomIn());
     $('zoom-out').addEventListener('click', () => state.map.zoomOut());
+    applyMapSettings();
   }
   function vehicleMatches(vehicle) {
-    const route = state.selectedRoute;
-    if (!route) return true;
-    if (!route.ref || vehicle.routeIsPublicNumber !== true || normalizeRef(vehicle.route) !== normalizeRef(route.ref)) return false;
-    const routeMode = modeOf(route.mode);
-    const vehicleMode = modeOf(vehicle.mode);
-    return routeMode === 'unknown' || vehicleMode === 'unknown' || routeMode === vehicleMode;
+    if (!state.settings.gps || !state.settings.modes.includes(modeOf(vehicle.mode))) return false;
+    if (!state.activeRoutes.size) return true;
+    return [...state.activeRoutes.values()].some(({ route }) => {
+      if (!route.ref || vehicle.routeIsPublicNumber !== true || normalizeRef(vehicle.route) !== normalizeRef(route.ref)) return false;
+      const routeMode = modeOf(route.mode);
+      const vehicleMode = modeOf(vehicle.mode);
+      return routeMode === 'unknown' || vehicleMode === 'unknown' || routeMode === vehicleMode;
+    });
   }
   function vehicleIcon(vehicle) {
     const isPublic = vehicle.routeIsPublicNumber === true;
@@ -226,6 +400,7 @@
     freshness.dataset.observedAt = vehicle.updatedAt;
     box.append(freshness, node('p', '', `GPS о ${clock(vehicle.updatedAt)} · Київський час`));
     box.append(node('p', '', 'КП «Київпастранс» · міське GPS-джерело. Без прогнозу прибуття.'), sourceLink());
+    box.append(button('Показати маршрут', 'button button-primary', () => chooseVehicleRoute(vehicle)));
     return box;
   }
   function updateAges() {
@@ -251,7 +426,7 @@
           icon: vehicleIcon(vehicle), title: clean(vehicle.name || vehicle.route, 150), keyboard: true, riseOnHover: true,
         }).addTo(state.map);
         state.markers.set(id, marker);
-        marker.bindPopup(vehiclePopup(vehicle), { maxWidth: 260, autoPanPaddingTopLeft: [15, 95], autoPanPaddingBottomRight: [15, 190] });
+        marker.bindPopup(vehiclePopup(vehicle));
       } else {
         marker.setLatLng([vehicle.lat, vehicle.lon]);
         if (marker._mappiTimestamp !== vehicle.updatedAt) marker.setPopupContent(vehiclePopup(vehicle));
@@ -265,19 +440,23 @@
       marker._mappiTimestamp = vehicle.updatedAt;
     }
     const count = visible.length;
-    const routePrefix = state.selectedRoute ? `${state.selectedRoute.ref ? `№ ${clean(state.selectedRoute.ref, 12)}` : 'Маршрут'} · ` : '';
-    $('live-status').textContent = state.liveFailed
+    const routePrefix = state.activeRoutes.size > 1 ? `${state.activeRoutes.size} маршрути · `
+      : state.selectedRoute ? `${state.selectedRoute.ref ? `№ ${clean(state.selectedRoute.ref, 12)}` : 'Маршрут'} · ` : '';
+    $('live-status').textContent = !state.settings.gps ? 'GPS вимкнено'
+      : state.liveFailed
       ? `${routePrefix}GPS недоступний${count ? ` · ${count} актуальних` : ''}`
-      : count ? `${routePrefix}${count} GPS-позицій${state.selectedRoute ? '' : ' · Київ'}` : `${routePrefix}Свіжих GPS-позицій немає`;
+      : count ? `${routePrefix}${count} GPS-позицій${state.selectedRoute ? '' : ' · Київ'}`
+      : state.vehicles.length ? `${routePrefix}За фільтрами машин немає` : `${routePrefix}Свіжих GPS-позицій немає`;
     $('connection-dot').classList.remove('is-loading');
     $('connection-dot').classList.toggle('is-offline', state.liveFailed || count === 0);
-    $('live-count').textContent = count ? `${count} машин на карті` : 'Свіжих позицій поки немає';
-    $('live-updated').textContent = state.liveFailed ? 'Спробуйте кнопку оновлення на карті'
+    $('live-count').textContent = !state.settings.gps ? 'GPS вимкнено' : count ? `${count} машин на карті` : state.vehicles.length ? 'За поточними фільтрами машин немає' : 'Свіжих позицій поки немає';
+    $('live-updated').textContent = !state.settings.gps ? 'Увімкніть шар GPS, щоб бачити транспорт' : state.liveFailed ? 'Спробуйте кнопку оновлення на карті'
       : state.fetchedAt ? `Знімок отримано о ${clock(state.fetchedAt)} · до 3 хв` : 'Джерело охоплює лише частину транспорту';
     if (state.activeTab === 'map-panel') $('sheet-kicker').textContent = `КИЇВ · ${count} GPS-ПОЗИЦІЙ`;
     updateAges();
   }
   async function refreshLive(manual = false) {
+    if (!state.settings.gps) { if (manual) toast('Увімкніть GPS у розділі «Карта».'); return; }
     if (!state.token || state.liveBusy || document.hidden) return;
     state.liveBusy = true;
     $('refresh').disabled = true;
@@ -299,21 +478,36 @@
     }
   }
   async function loadRoutes() {
-    if (!state.token || state.routesBusy) return;
+    if (!state.token) return null;
+    if (state.routes) return state.routes;
+    if (state.routePromise) return state.routePromise;
     state.routesBusy = true;
     loading($('routes-results'), 'Завантажуємо маршрути Києва…');
-    try {
-      const result = await api('/api/routes');
-      state.routes = Array.isArray(result.routes) ? result.routes.slice(0, 2500) : [];
-      renderRoutes();
-    } catch {
-      empty($('routes-results'), 'Маршрути зараз недоступні', 'Не вдалося отримати каталог OpenStreetMap. Карта й GPS працюють окремо.', loadRoutes);
-    } finally { state.routesBusy = false; }
+    state.routePromise = (async () => {
+      try {
+        const result = await api('/api/routes', { timeoutMs: 40_000 });
+        state.routes = Array.isArray(result.routes) ? result.routes.slice(0, 2500) : [];
+        renderRoutes();
+        if (state.selectedRoute && $('route-detail').dataset.routeId === state.selectedRoute.id) renderRouteDetail(state.selectedRoute);
+        return state.routes;
+      } catch {
+        empty($('routes-results'), 'Маршрути зараз недоступні', 'Не вдалося отримати каталог OpenStreetMap. Карта й GPS працюють окремо.', loadRoutes);
+        return null;
+      } finally { state.routesBusy = false; state.routePromise = null; }
+    })();
+    return state.routePromise;
+  }
+  function makeRouteCard(route, action = () => selectRoute(route)) {
+    const card = button('', 'result-card', action);
+    const copy = node('span', 'result-copy');
+    copy.append(node('strong', '', routeTitle(route)), node('p', '', `${MODE_NAMES[modeOf(route.mode)]}${route.operator ? ` · ${clean(route.operator, 65)}` : ''}`));
+    card.append(routeNumber(route), copy, node('span', 'result-arrow', '›'));
+    return card;
   }
   function renderRoutes() {
     const query = $('route-query').value.trim().toLocaleLowerCase('uk-UA');
     const matches = (state.routes ?? []).filter((route) => {
-      if (state.mode !== 'all' && modeOf(route.mode) !== state.mode) return false;
+      if (state.catalogMode !== 'all' && modeOf(route.mode) !== state.catalogMode) return false;
       return !query || [route.ref, route.name, route.from, route.to].some((value) => clean(value, 300).toLocaleLowerCase('uk-UA').includes(query));
     });
     $('routes-count').textContent = `Напрямків: ${matches.length}`;
@@ -323,62 +517,137 @@
     }
     const fragment = document.createDocumentFragment();
     for (const route of matches) {
-      const card = button('', 'result-card', () => selectRoute(route));
-      const copy = node('span', 'result-copy');
-      copy.append(node('strong', '', routeTitle(route)), node('p', '', `${MODE_NAMES[modeOf(route.mode)]}${route.operator ? ` · ${clean(route.operator, 65)}` : ''}`));
-      card.append(routeNumber(route), copy, node('span', 'result-arrow', '›'));
-      fragment.append(card);
+      const row = node('div', `route-catalog-row${state.activeRoutes.has(route.id) ? ' is-selected' : ''}`);
+      const saved = state.favoriteRoutes.some((item) => item.id === route.id);
+      const favorite = button(saved ? '★' : '☆', `favorite-route-button${saved ? ' is-saved' : ''}`, () => toggleFavoriteRoute(route));
+      favorite.setAttribute('aria-label', `${saved ? 'Прибрати' : 'Зберегти'} маршрут ${clean(route.ref)} ${routeTitle(route)}`);
+      const active = state.activeRoutes.has(route.id);
+      const overlay = button(active ? '✓' : '+', `route-overlay-button${active ? ' is-active' : ''}`, () => active ? removeRoute(route.id) : selectRoute(route));
+      overlay.setAttribute('aria-label', `${active ? 'Прибрати з карти' : 'Додати на карту'} маршрут ${clean(route.ref)} ${routeTitle(route)}`);
+      overlay.setAttribute('aria-pressed', String(active));
+      row.append(makeRouteCard(route), favorite, overlay);
+      fragment.append(row);
     }
     $('routes-results').replaceChildren(fragment);
   }
   function clearRoute(showCatalog = true) {
+    window.dispatchEvent(new CustomEvent('mappi:map-reset'));
     state.routeSequence++;
     state.selectedRoute = null;
-    state.routeLayer?.clearLayers();
+    for (const entry of state.activeRoutes.values()) { state.map.removeLayer(entry.lines); state.map.removeLayer(entry.stops); }
+    state.activeRoutes.clear();
     $('route-map-label').hidden = true;
     if (showCatalog) { $('route-detail').hidden = true; $('route-catalog').hidden = false; }
+    renderActiveRoutes();
+    if (state.routes) renderRoutes();
     renderVehicles();
   }
-  async function selectRoute(route) {
-    clearRoute(false);
+  function backFromRoute() {
+    state.routeSequence++;
+    $('route-detail').hidden = true;
+    $('route-catalog').hidden = false;
+    switchTab(state.routeReturnTab === 'favorites-panel' ? 'favorites-panel' : 'routes-panel');
+  }
+  function removeRoute(id) {
+    const entry = state.activeRoutes.get(id);
+    if (!entry) return;
+    state.map.removeLayer(entry.lines); state.map.removeLayer(entry.stops);
+    state.activeRoutes.delete(id);
+    if (state.selectedRoute?.id === id) {
+      state.routeSequence++;
+      const next = [...state.activeRoutes.values()].at(-1);
+      state.selectedRoute = next?.route || null;
+      if (next) focusRoute(next.route.id, false);
+      else { $('route-map-label').hidden = true; $('route-detail').hidden = true; $('route-catalog').hidden = false; }
+    }
+    renderActiveRoutes(); renderVehicles();
+    if (state.routes) renderRoutes();
+  }
+  function renderActiveRoutes() {
+    $('active-routes').hidden = !state.activeRoutes.size;
+    const fragment = document.createDocumentFragment();
+    const heading = node('div', 'list-heading');
+    heading.append(node('span', '', `На карті: ${state.activeRoutes.size} / 4`), button('Прибрати всі', 'text-button', () => clearRoute()));
+    fragment.append(heading);
+    for (const { route } of state.activeRoutes.values()) {
+      const row = node('div', 'active-route-row');
+      const focus = button('', `active-route-focus${state.selectedRoute?.id === route.id ? ' is-active' : ''}`, () => {
+        switchTab('routes-panel'); focusRoute(route.id);
+      });
+      focus.append(routeNumber(route), node('span', '', routeTitle(route)));
+      const remove = button('×', 'remove-favorite', () => removeRoute(route.id));
+      remove.setAttribute('aria-label', `Прибрати з карти маршрут ${clean(route.ref)} ${routeTitle(route)}`);
+      row.append(focus, remove); fragment.append(row);
+    }
+    $('active-routes').replaceChildren(fragment);
+  }
+  function focusRoute(id, fit = true) {
+    const entry = state.activeRoutes.get(id);
+    if (!entry) return;
+    state.selectedRoute = entry.route;
+    $('route-map-ref').textContent = clean(entry.route.ref || '—', 15);
+    $('route-map-ref').className = `route-number mode-${modeOf(entry.route.mode)}`;
+    $('route-map-name').textContent = routeTitle(entry.route);
+    $('route-map-label').hidden = false;
+    $('route-catalog').hidden = true; $('route-detail').hidden = false;
+    renderRouteDetail(entry.route);
+    renderActiveRoutes(); renderVehicles();
+    if (fit) {
+      if (window.innerWidth < 650) setExpanded(false);
+      if (entry.bounds.isValid()) fitPoints(entry.bounds, 15);
+    }
+  }
+  async function selectRoute(route, options = {}) {
+    if (!route?.id) return;
+    state.routeReturnTab = options.returnTab || (state.activeTab === 'favorites-panel' ? 'favorites-panel' : 'routes-panel');
+    if (state.activeRoutes.has(route.id)) {
+      if (options.replaceId && options.replaceId !== route.id) removeRoute(options.replaceId);
+      switchTab('routes-panel'); focusRoute(route.id); return;
+    }
+    if (state.activeRoutes.size >= 4 && !state.activeRoutes.has(options.replaceId)) {
+      toast('На карті вже 4 маршрути. Приберіть один зі списку в розділі «Карта».');
+      switchTab('map-panel'); return;
+    }
     state.nearbySequence++;
     $('nearby').disabled = false;
     const sequence = ++state.routeSequence;
+    switchTab('routes-panel');
     $('route-catalog').hidden = true;
     $('route-detail').hidden = false;
-    const back = button('← Усі маршрути', 'route-detail-back', () => clearRoute());
+    delete $('route-detail').dataset.routeId;
+    const back = button('← Назад до списку', 'route-detail-back', backFromRoute);
     const loadingBox = node('div');
     loading(loadingBox, `Завантажуємо маршрут ${clean(route.ref, 15)}…`);
     $('route-detail').replaceChildren(back, loadingBox);
     try {
-      const detail = await api(`/api/route?${new URLSearchParams({ id: route.id })}`);
+      const detail = await api(`/api/route?${new URLSearchParams({ id: route.id })}`, { timeoutMs: 65_000 });
       if (sequence !== state.routeSequence) return;
-      state.selectedRoute = detail;
+      if (options.replaceId) removeRoute(options.replaceId);
       state.stopsLayer.clearLayers();
       state.placeLayer.clearLayers();
       const color = MODE_COLORS[modeOf(detail.mode)] || MODE_COLORS.unknown;
+      const lines = L.featureGroup();
+      const stops = L.featureGroup();
       for (const line of Array.isArray(detail.lines) ? detail.lines : []) {
         if (!Array.isArray(line) || line.length < 2 || !line.every((point) => Array.isArray(point) && validPosition({ lat: point[0], lon: point[1] }))) continue;
-        L.polyline(line, { color: '#ffffff', weight: 8, opacity: .9, interactive: false }).addTo(state.routeLayer);
-        L.polyline(line, { color, weight: 4.5, opacity: .92, lineCap: 'round', lineJoin: 'round', interactive: false }).addTo(state.routeLayer);
+        L.polyline(line, { color: '#ffffff', weight: 8, opacity: .9, interactive: false }).addTo(lines);
+        L.polyline(line, { color, weight: 4.5, opacity: .92, lineCap: 'round', lineJoin: 'round', interactive: false }).addTo(lines);
       }
-      for (const stop of (detail.stops ?? []).filter(validPosition)) makeStopMarker(stop, state.routeLayer);
-      $('route-map-ref').textContent = clean(detail.ref || '—', 15);
-      $('route-map-ref').className = `route-number mode-${modeOf(detail.mode)}`;
-      $('route-map-name').textContent = routeTitle(detail);
-      $('route-map-label').hidden = false;
-      renderRouteDetail(detail);
-      renderVehicles();
-      if (window.innerWidth < 650) setExpanded(false);
-      if (state.routeLayer.getBounds().isValid()) fitPoints(state.routeLayer.getBounds(), 15);
-      else toast('У маршруті немає геометрії або координат зупинок.');
+      for (const stop of (detail.stops ?? []).filter(validPosition)) makeStopMarker({ ...stop, mode: detail.mode }, stops);
+      const bounds = lines.getBounds();
+      if (stops.getBounds().isValid()) bounds.extend(stops.getBounds());
+      state.activeRoutes.set(detail.id, { route: detail, lines, stops, bounds });
+      applyMapSettings();
+      if (state.routes) renderRoutes();
+      focusRoute(detail.id);
     } catch (error) {
       if (sequence !== state.routeSequence) return;
-      empty(loadingBox, 'Не вдалося відкрити маршрут', error.status === 404 ? 'Цей напрямок більше не доступний у каталозі.' : 'Джерело маршруту тимчасово недоступне.', () => selectRoute(route));
+      empty(loadingBox, 'Не вдалося відкрити маршрут', error.status === 404 ? 'Цей напрямок більше не доступний у каталозі.' : 'Джерело маршруту тимчасово недоступне.', () => selectRoute(route, options));
     }
   }
   function renderRouteDetail(route) {
-    const back = button('← Усі маршрути', 'route-detail-back', () => clearRoute());
+    $('route-detail').dataset.routeId = route.id;
+    const back = button(state.routeReturnTab === 'favorites-panel' ? '← До обраного' : '← Усі маршрути', 'route-detail-back', backFromRoute);
     const heading = node('div', 'route-detail-top');
     const copy = node('div');
     copy.append(node('h2', '', routeTitle(route)), node('p', '', `${MODE_NAMES[modeOf(route.mode)]} · напрямок з OpenStreetMap`));
@@ -386,15 +655,74 @@
     const stops = Array.isArray(route.stops) ? route.stops.filter(validPosition) : [];
     const metadata = node('div', 'route-meta');
     metadata.append(node('span', '', `${stops.length} позначок зупинок`), node('span', '', '© OpenStreetMap'));
+    const saved = state.favoriteRoutes.some((item) => item.id === route.id);
+    const actions = node('div', 'route-detail-actions');
+    actions.append(button(saved ? '★ Маршрут в обраному' : '☆ Зберегти маршрут', 'button button-secondary', () => toggleFavoriteRoute(route)),
+      button('Прибрати з карти', 'text-button', () => removeRoute(route.id)));
     const note = node('p', 'route-note', 'Платформа й зупинка можуть мати окремі позначки. GPS відфільтровано за номером і, коли доступно, типом транспорту; напрямок руху GPS не визначено. Зворотний напрямок оберіть окремо в каталозі.');
     const list = node('ol', 'route-stops');
     for (const stop of stops) {
       const item = node('li', 'route-stop');
-      item.append(button(clean(stop.name || 'Зупинка'), '', () => showStop(stop, false)));
+      item.append(button(clean(stop.name || 'Зупинка'), '', () => showStop(stop)));
       list.append(item);
     }
     if (!stops.length) list.append(node('p', 'field-note', 'Зупинки з координатами не внесено до цього напрямку.'));
-    $('route-detail').replaceChildren(back, heading, metadata, note, list);
+    const variants = relatedVariants(route);
+    const variantsBox = node('div', 'route-variants');
+    if (variants.length) {
+      const explicit = Boolean(route.routeMasterId);
+      variantsBox.append(node('label', 'field-label', explicit ? 'Напрямок маршруту' : 'Варіанти цього номера'));
+      const select = node('select', 'direction-select');
+      select.setAttribute('aria-label', explicit ? 'Напрямок маршруту' : 'Варіанти номера за типом і перевізником');
+      for (const variant of [route, ...variants]) {
+        const option = node('option', '', routeTitle(variant)); option.value = variant.id; select.append(option);
+      }
+      select.value = route.id;
+      select.addEventListener('change', () => {
+        const variant = variants.find((item) => item.id === select.value);
+        if (variant) selectRoute(variant, { replaceId: route.id, returnTab: state.routeReturnTab });
+      });
+      variantsBox.append(select);
+      if (!explicit) variantsBox.append(node('p', 'field-note', 'Збіг номера, типу й перевізника. Це можуть бути різні варіанти, не лише зворотний напрямок.'));
+    }
+    $('route-detail').replaceChildren(back, heading, metadata, actions, variantsBox, note, list);
+  }
+  function relatedVariants(route) {
+    return (state.routes || []).filter((candidate) => {
+      if (candidate.id === route.id) return false;
+      if (route.routeMasterId) return candidate.routeMasterId === route.routeMasterId;
+      return route.ref && normalizeRef(candidate.ref) === normalizeRef(route.ref)
+        && modeOf(candidate.mode) === modeOf(route.mode)
+        && clean(candidate.operator).toLocaleLowerCase('uk') === clean(route.operator).toLocaleLowerCase('uk');
+    }).slice(0, 30);
+  }
+  async function chooseVehicleRoute(vehicle) {
+    state.map.closePopup();
+    state.routeReturnTab = 'routes-panel';
+    const sequence = ++state.routeSequence;
+    switchTab('routes-panel');
+    $('route-catalog').hidden = true; $('route-detail').hidden = false;
+    delete $('route-detail').dataset.routeId;
+    const container = node('div');
+    $('route-detail').replaceChildren(button('← Усі маршрути', 'route-detail-back', backFromRoute), container);
+    if (vehicle.routeIsPublicNumber !== true) {
+      empty(container, 'Номер маршруту невідомий', 'Джерело передало лише технічний ID. Оберіть потрібну схему в каталозі.'); return;
+    }
+    loading(container, 'Шукаємо схему маршруту…');
+    const routes = await loadRoutes();
+    if (!container.isConnected || sequence !== state.routeSequence) return;
+    if (!routes) { empty(container, 'Каталог недоступний', 'Спробуйте ще раз трохи пізніше.', () => chooseVehicleRoute(vehicle)); return; }
+    const vehicleMode = modeOf(vehicle.mode);
+    const matches = routes.filter((route) => normalizeRef(route.ref) === normalizeRef(vehicle.route)
+      && (vehicleMode === 'unknown' || modeOf(route.mode) === vehicleMode));
+    if (!matches.length) {
+      empty(container, 'Схеми в каталозі немає', 'GPS цього маршруту доступний, але відповідної схеми OpenStreetMap не знайдено.'); return;
+    }
+    if (matches.length === 1) { selectRoute(matches[0]); return; }
+    container.replaceChildren(node('p', 'field-note', vehicleMode === 'unknown'
+      ? 'Тип транспорту у GPS не визначено. Оберіть потрібний тип і варіант маршруту.'
+      : 'GPS не визначає напрямок. Оберіть схему, яку хочете переглянути.'));
+    for (const route of matches) container.append(makeRouteCard(route));
   }
   function stopPopup(stop) {
     const box = node('div', 'map-popup');
@@ -407,20 +735,72 @@
       }
     }));
     box.append(node('p', '', 'Обране зберігається на цьому пристрої.'));
+    box.append(pointActions(stop));
+    const routes = node('div', 'popup-routes');
+    loading(routes, 'Маршрути зупинки…');
+    box.append(routes);
     return box;
+  }
+  async function loadStopRoutes(stop, container, popup) {
+    const normalized = savedStop(stop);
+    const key = [normalized.id, ...(normalized.osmIds || [])].sort().join(',');
+    const cached = state.stopRouteCache.get(key);
+    try {
+      let routes;
+      if (cached && cached.expires > Date.now()) routes = cached.routes;
+      else {
+        let pending = state.stopRoutePending.get(key);
+        if (!pending) {
+          pending = api('/api/stop-routes', { method: 'POST', body: { stop: normalized }, timeoutMs: 40_000 }).then((result) => {
+            const list = Array.isArray(result.routes) ? result.routes.slice(0, 40) : [];
+            while (state.stopRouteCache.size >= 100) state.stopRouteCache.delete(state.stopRouteCache.keys().next().value);
+            state.stopRouteCache.set(key, { routes: list, expires: Date.now() + 300_000 });
+            return list;
+          }).finally(() => state.stopRoutePending.delete(key));
+          state.stopRoutePending.set(key, pending);
+        }
+        routes = await pending;
+      }
+      if (!container.isConnected) return;
+      if (!routes.length) { container.replaceChildren(node('p', 'field-note', 'Маршрути не внесені до цієї зупинки в OpenStreetMap. Прогноз прибуття недоступний.')); return; }
+      container.replaceChildren(node('p', 'popup-routes-heading', 'Маршрути цієї зупинки'));
+      for (const route of routes) {
+        const item = button('', 'popup-route', () => { state.map.closePopup(); selectRoute(route); });
+        item.append(routeNumber(route, true), node('span', '', `${MODE_NAMES[modeOf(route.mode)]} · ${routeTitle(route)}`));
+        container.append(item);
+      }
+      container.append(node('p', 'field-note', 'Довідкові дані OSM. Без прогнозу прибуття.'));
+    } catch {
+      if (!container.isConnected) return;
+      container.replaceChildren(node('p', 'field-note', 'Маршрути зараз недоступні.'),
+        button('Спробувати ще раз', 'text-button', () => {
+          loading(container, 'Маршрути зупинки…');
+          updatePopupLayout(popup);
+          loadStopRoutes(stop, container, popup);
+        }));
+    } finally {
+      if (container.isConnected) updatePopupLayout(popup);
+    }
   }
   function makeStopMarker(stop, layer) {
     const content = node('div', 'stop-marker');
     const marker = L.marker([stop.lat, stop.lon], {
       icon: L.divIcon({ html: content, className: 'stop-icon', iconSize: [13, 13], iconAnchor: [6, 6], popupAnchor: [0, -9] }),
       title: clean(stop.name || 'Зупинка'), keyboard: true,
-    }).bindPopup(stopPopup(stop), { maxWidth: 260, autoPanPaddingTopLeft: [15, 100], autoPanPaddingBottomRight: [15, 190] });
-    marker.on('popupopen', () => { marker.setPopupContent(stopPopup(stop)); });
+    }).bindPopup(stopPopup(stop));
+    marker.on('popupopen', () => {
+      state.activeStop = stop; state.selectedPoint = stop;
+      const content = stopPopup(stop);
+      marker.setPopupContent(content);
+      loadStopRoutes(stop, content.querySelector('.popup-routes'), marker.getPopup());
+    });
     return marker.addTo(layer);
   }
-  function showStop(stop, collapse = true) {
+  function showStop(stop) {
+    if (!validPosition(stop)) return;
     state.activeStop = stop;
-    if (collapse) setExpanded(false);
+    state.selectedPoint = stop;
+    setExpanded(false);
     state.placeLayer.clearLayers();
     const marker = makeStopMarker(stop, state.placeLayer);
     focusPosition(stop, 17);
@@ -443,7 +823,7 @@
     loading($('nearby-results'), 'Шукаємо зупинки поруч…');
     $('nearby').disabled = true;
     try {
-      const result = await api(`/api/stops?${new URLSearchParams({ lat: String(position.lat), lon: String(position.lon) })}`);
+      const result = await api(`/api/stops?${new URLSearchParams({ lat: String(position.lat), lon: String(position.lon) })}`, { timeoutMs: 40_000 });
       if (sequence !== state.nearbySequence) return;
       const stops = Array.isArray(result.stops) ? result.stops.filter(validPosition).slice(0, 50) : [];
       state.stopsLayer.clearLayers();
@@ -480,7 +860,8 @@
           const marker = L.marker([place.lat, place.lon], {
             icon: L.divIcon({ html: node('div', 'place-marker'), className: 'stop-icon', iconSize: [23, 23], iconAnchor: [11, 11] }), title: clean(place.name),
           }).addTo(state.placeLayer);
-          marker.bindPopup(node('strong', '', clean(place.name, 200)));
+          state.selectedPoint = place;
+          marker.bindPopup(pointPopup(place));
           focusPosition(place, 16);
           nearbyStops(place);
         });
@@ -493,16 +874,33 @@
       if (sequence === state.searchSequence) empty($('search-results'), 'Пошук тимчасово недоступний', 'Спробуйте ще раз або знайдіть місце на карті.', () => $('place-search').requestSubmit());
     } finally { if (sequence === state.searchSequence) $('search-submit').disabled = false; }
   }
-  function readFavorites() {
-    try {
-      const saved = JSON.parse(localStorage.getItem(FAVORITES_KEY) || '[]');
-      state.favorites = Array.isArray(saved) ? saved.filter((stop) => validPosition(stop) && typeof stop.id === 'string').slice(0, 30) : [];
-    } catch { state.favorites = []; }
+  function savedStop(stop) {
+    const osmIds = Array.isArray(stop.osmIds) ? [...new Set(stop.osmIds.filter((id) => /^(node|way|relation)\/[1-9]\d*$/.test(id)))].slice(0, 20) : [];
+    return { id: clean(stop.id, 120), name: clean(stop.name || 'Зупинка'), lat: stop.lat, lon: stop.lon, mode: modeOf(stop.mode), ...(osmIds.length ? { osmIds } : {}) };
   }
-  function saveFavorites(next) {
-    try { localStorage.setItem(FAVORITES_KEY, JSON.stringify(next)); }
+  function savedRoute(route) {
+    return { id: clean(route.id, 120), ref: clean(route.ref, 40), name: clean(route.name, 240), from: clean(route.from), to: clean(route.to), mode: modeOf(route.mode), operator: clean(route.operator), city: 'kyiv' };
+  }
+  function readFavorites() {
+    let saved;
+    try { saved = JSON.parse(localStorage.getItem(FAVORITES_KEY) || 'null'); } catch { /* Try the previous format below. */ }
+    if (saved?.version === 2) {
+      state.favorites = Array.isArray(saved.stops) ? saved.stops.filter((stop) => validPosition(stop) && typeof stop.id === 'string').slice(0, 30).map(savedStop) : [];
+      state.favoriteRoutes = Array.isArray(saved.routes) ? saved.routes.filter((route) => /^relation\/[1-9]\d*$/.test(route?.id)).slice(0, 30).map(savedRoute) : [];
+      return;
+    }
+    try {
+      const old = JSON.parse(localStorage.getItem(OLD_FAVORITES_KEY) || '[]');
+      state.favorites = Array.isArray(old) ? old.filter((stop) => validPosition(stop) && typeof stop.id === 'string').slice(0, 30).map(savedStop) : [];
+      // Keep v1 intact as a fallback if writing v2 fails; never overwrite it.
+      localStorage.setItem(FAVORITES_KEY, JSON.stringify({ version: 2, stops: state.favorites, routes: [] }));
+    } catch { /* Imported favorites remain available for this session. */ }
+  }
+  function saveFavorites(next, routes = state.favoriteRoutes) {
+    try { localStorage.setItem(FAVORITES_KEY, JSON.stringify({ version: 2, stops: next, routes })); }
     catch { toast('Браузер не дозволив зберегти обране на цьому пристрої.'); return false; }
     state.favorites = next;
+    state.favoriteRoutes = routes;
     renderFavorites();
     return true;
   }
@@ -510,25 +908,44 @@
     if (!validPosition(stop) || !stop.id) return false;
     const exists = state.favorites.some((item) => item.id === stop.id);
     if (!exists && state.favorites.length >= 30) { toast('В обраному вже 30 зупинок. Спочатку приберіть зайву.'); return false; }
-    const next = exists ? state.favorites.filter((item) => item.id !== stop.id) : [...state.favorites, {
-      id: clean(stop.id, 120), name: clean(stop.name || 'Зупинка'), lat: stop.lat, lon: stop.lon, mode: modeOf(stop.mode),
-    }];
+    state.favoriteTab = 'stops';
+    const next = exists ? state.favorites.filter((item) => item.id !== stop.id) : [...state.favorites, savedStop(stop)];
     const success = saveFavorites(next);
     if (success) toast(exists ? 'Зупинку прибрано з обраного' : 'Зупинку збережено на цьому пристрої');
     return success;
   }
+  function toggleFavoriteRoute(route) {
+    if (!/^relation\/[1-9]\d*$/.test(route?.id)) return false;
+    const exists = state.favoriteRoutes.some((item) => item.id === route.id);
+    if (!exists && state.favoriteRoutes.length >= 30) { toast('В обраному вже 30 маршрутів. Спочатку приберіть зайвий.'); return false; }
+    const next = exists ? state.favoriteRoutes.filter((item) => item.id !== route.id) : [...state.favoriteRoutes, savedRoute(route)];
+    state.favoriteTab = 'routes';
+    if (!saveFavorites(state.favorites, next)) return false;
+    if (state.routes) renderRoutes();
+    if (state.selectedRoute) renderRouteDetail(state.selectedRoute);
+    toast(exists ? 'Маршрут прибрано з обраного' : 'Маршрут збережено на цьому пристрої');
+    return true;
+  }
   function renderFavorites() {
-    $('clear-favorites').hidden = !state.favorites.length;
-    if (!state.favorites.length) {
-      empty($('favorites-results'), 'Ваші зупинки будуть тут', 'Натисніть зупинку на карті та збережіть її. Обране доступне лише на цьому пристрої.');
+    const showRoutes = state.favoriteTab === 'routes';
+    for (const kind of ['stops', 'routes']) {
+      $(`favorites-${kind}`).classList.toggle('is-active', state.favoriteTab === kind);
+      $(`favorites-${kind}`).setAttribute('aria-pressed', String(state.favoriteTab === kind));
+    }
+    const list = showRoutes ? state.favoriteRoutes : state.favorites;
+    $('favorites-count').textContent = `${showRoutes ? 'Маршрути' : 'Зупинки'}: ${list.length}`;
+    $('clear-favorites').hidden = !state.favorites.length && !state.favoriteRoutes.length;
+    if (!list.length) {
+      empty($('favorites-results'), showRoutes ? 'Ваші маршрути будуть тут' : 'Ваші зупинки будуть тут', showRoutes
+        ? 'Натисніть зірочку біля маршруту в каталозі або в його картці.' : 'Натисніть зупинку на карті та збережіть її. Обране доступне лише на цьому пристрої.');
       return;
     }
     const fragment = document.createDocumentFragment();
-    for (const stop of state.favorites) {
+    for (const item of list) {
       const row = node('div', 'favorite-row');
-      const remove = button('×', 'remove-favorite', () => toggleFavorite(stop));
-      remove.setAttribute('aria-label', `Прибрати з обраного: ${clean(stop.name)}`);
-      row.append(stopCard(stop), remove); fragment.append(row);
+      const remove = button('×', 'remove-favorite', () => showRoutes ? toggleFavoriteRoute(item) : toggleFavorite(item));
+      remove.setAttribute('aria-label', `Прибрати з обраного: ${clean(showRoutes ? item.ref : item.name)}`);
+      row.append(showRoutes ? makeRouteCard(item, () => selectRoute(item, { returnTab: 'favorites-panel' })) : stopCard(item), remove); fragment.append(row);
     }
     $('favorites-results').replaceChildren(fragment);
   }
@@ -557,28 +974,34 @@
       const center = state.map.getCenter(); nearbyStops({ lat: center.lat, lon: center.lng });
     });
     $('place-search').addEventListener('submit', searchPlaces);
+    for (const key of ['gps', 'lines', 'stops']) $(`toggle-${key}`).addEventListener('change', () => {
+      state.settings[key] = $(`toggle-${key}`).checked;
+      persistSettings(); applyMapSettings();
+      if (key === 'gps' && state.settings.gps) refreshLive();
+    });
     $('route-query').addEventListener('input', () => { if (state.routes) renderRoutes(); });
-    for (const chip of document.querySelectorAll('.mode-chip')) chip.addEventListener('click', () => {
-      state.mode = chip.dataset.mode;
-      for (const item of document.querySelectorAll('.mode-chip')) {
+    for (const chip of document.querySelectorAll('#mode-filters .mode-chip')) chip.addEventListener('click', () => {
+      state.catalogMode = chip.dataset.mode;
+      for (const item of document.querySelectorAll('#mode-filters .mode-chip')) {
         const selected = item === chip; item.classList.toggle('is-active', selected); item.setAttribute('aria-pressed', String(selected));
       }
       if (state.routes) renderRoutes();
     });
-    $('clear-route').addEventListener('click', () => clearRoute());
+    $('clear-route').addEventListener('click', () => { if (state.selectedRoute) removeRoute(state.selectedRoute.id); });
     $('open-route-detail').addEventListener('click', () => switchTab('routes-panel'));
     $('home').addEventListener('click', (event) => {
       event.preventDefault(); clearRoute(); state.stopsLayer.clearLayers(); state.placeLayer.clearLayers();
       state.nearbySequence++; $('nearby').disabled = false;
       switchTab('map-panel', false); fitPoints(L.latLngBounds(KYIV_BOUNDS), 12);
     });
-    $('clear-favorites').addEventListener('click', () => { if (saveFavorites([])) toast('Обране на цьому пристрої очищено'); });
+    $('clear-favorites').addEventListener('click', () => { if (saveFavorites([], [])) toast('Обране на цьому пристрої очищено'); });
+    for (const kind of ['stops', 'routes']) $(`favorites-${kind}`).addEventListener('click', () => { state.favoriteTab = kind; renderFavorites(); });
     $('about-button').addEventListener('click', () => $('about-dialog').showModal());
     $('close-about').addEventListener('click', () => $('about-dialog').close());
     $('close-about-bottom').addEventListener('click', () => $('about-dialog').close());
     $('about-dialog').addEventListener('click', (event) => { if (event.target === $('about-dialog')) $('about-dialog').close(); });
     document.addEventListener('visibilitychange', () => { if (!document.hidden && state.token) { renderVehicles(); refreshLive(); } });
-    window.addEventListener('resize', () => { state.map?.invalidateSize(); });
+    window.addEventListener('resize', () => { state.map?.invalidateSize(); updatePopupLayout(state.openPopup); });
   }
   async function boot() {
     state.tg = window.Telegram?.WebApp;
@@ -602,8 +1025,11 @@
     $('welcome').hidden = true;
     $('application').hidden = false;
     readFavorites();
+    readSettings();
     initializeMap();
     bindInterface();
+    publishBridge();
+    if (requestedPanel && $(requestedPanel)?.classList.contains('panel')) { switchTab(requestedPanel); requestedPanel = null; }
     await refreshLive();
     setInterval(() => { if (!document.hidden && state.token) refreshLive(); }, 20_000);
     setInterval(() => { if (state.token) renderVehicles(); }, 5000);

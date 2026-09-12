@@ -10,7 +10,8 @@
   "scripts": {
     "start": "node --env-file-if-exists=.env src/main.mjs",
     "test": "node --test",
-    "check": "node --check src/main.mjs && node --check src/bot.mjs && node --check src/providers.mjs && node --check src/map-server.mjs && node --check src/map-data.mjs && node --check web/app.js",
+    "check": "node scripts/check.mjs",
+    "check:easyway": "node --env-file-if-exists=.env scripts/check-easyway.mjs",
     "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {

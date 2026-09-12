@@ -70,6 +70,49 @@ test('Mini App links require private access and use the current tunnel URL', asy
   assert.match(f.last().text, /приватний бот/);
 });
 
+test('trip and schedule links preserve private authorization and select the matching Mini App panel', async () => {
+  let reads = 0;
+  let url = 'https://first.trycloudflare.com/app?city=kyiv#panel=old';
+  const f = fixture({ getMapUrl: () => { reads++; return url; } });
+  await f.send('/trip');
+  await f.send('/schedule');
+  assert.equal(reads, 0);
+  assert.ok(f.sent.every((item) => !item.reply_markup?.inline_keyboard));
+  await f.send('/start friends-secret');
+  await f.send('/trip@MappiBashmakBot');
+  const trip = new URL(f.last().reply_markup.inline_keyboard[0][0].web_app.url);
+  assert.equal(trip.origin, 'https://first.trycloudflare.com');
+  assert.equal(trip.pathname, '/app');
+  assert.equal(trip.search, '?city=kyiv');
+  assert.equal(trip.hash, '#panel=journeys-panel');
+  assert.match(f.last().text, /точки A та B/);
+  url = 'https://second.trycloudflare.com/';
+  await f.send('/schedule');
+  assert.equal(f.last().reply_markup.inline_keyboard[0][0].web_app.url, `${url}#panel=schedules-panel`);
+  assert.match(f.last().text, /Опубліковані розклади/);
+  await f.send('↔️ Спланувати поїздку');
+  assert.equal(new URL(f.last().reply_markup.inline_keyboard[0][0].web_app.url).hash, '#panel=journeys-panel');
+  await f.send('🕒 Розклади');
+  assert.equal(new URL(f.last().reply_markup.inline_keyboard[0][0].web_app.url).hash, '#panel=schedules-panel');
+  await f.send('/forget');
+  await f.send('/schedule');
+  assert.match(f.last().text, /приватний бот/);
+  assert.equal(f.providerCalls.length, 0);
+});
+
+test('feature commands are silent in groups and handle an unavailable map URL', async () => {
+  const f = fixture({ allowedUserIds: [11], getMapUrl: () => '' });
+  await f.bot.handleUpdate(f.message(11, '/trip', { chat: { id: -55, type: 'group' } }));
+  await f.bot.handleUpdate(f.message(11, '/schedule', { chat: { id: -55, type: 'supergroup' } }));
+  assert.equal(f.sent.length, 0);
+  await f.send('/trip');
+  assert.match(f.last().text, /Карта запускається/);
+  assert.equal(f.last().reply_markup, undefined);
+  await f.send('/schedule');
+  assert.match(f.last().text, /Карта запускається/);
+  assert.equal(f.last().reply_markup, undefined);
+});
+
 test('configured users are allowed without saving their search or geographic position', async () => {
   const f = fixture({ allowedUserIds: [11] });
   await f.send('Контрактова площа');
