@@ -45,7 +45,7 @@ class Queue {
 }
 
 const nominatimQueue = new Queue(1_100, 12);
-const overpassQueue = new Queue(1_100, 10);
+export const overpassQueue = new Queue(1_100, 10);
 const dniproQueue = new Queue(1_100, 8);
 
 class Cache {

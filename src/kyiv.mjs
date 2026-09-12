@@ -101,6 +101,7 @@ export function createKyivProvider({
       const name = `${mode} · ${publicRoute ? `№ ${publicRoute}` : `маршрут ${route}`} ${board ? `· борт ${board}` : ''}`.trim();
       const vehicle = {
         id, route, routeIsPublicNumber: Boolean(publicRoute), name, lat, lon,
+        mode: ({ 1: 'tram', 2: 'trolleybus', 3: 'bus' })[routeId.split('_')[0]] || 'unknown',
         // Slight clock skew is tolerated, but the UI must not show future data.
         updatedAt: new Date(Math.min(observationTime, currentTime)).toISOString()
       };

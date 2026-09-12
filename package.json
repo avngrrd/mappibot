@@ -10,11 +10,12 @@
   "scripts": {
     "start": "node --env-file-if-exists=.env src/main.mjs",
     "test": "node --test",
-    "check": "node --check src/main.mjs && node --check src/bot.mjs && node --check src/providers.mjs",
+    "check": "node --check src/main.mjs && node --check src/bot.mjs && node --check src/providers.mjs && node --check src/map-server.mjs && node --check src/map-data.mjs && node --check web/app.js",
     "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {
     "gtfs-realtime-bindings": "^2.2.0",
+    "leaflet": "1.9.4",
     "proper-lockfile": "^4.1.2"
   }
 }

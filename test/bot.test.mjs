@@ -22,6 +22,7 @@ function fixture(options = {}) {
   const bot = createBot({
     telegram: options.telegram ?? { call: async (method, payload) => { sent.push({ method, ...structuredClone(payload) }); return {}; } },
     providers, store, inviteCode: 'friends-secret', allowedUserIds: options.allowedUserIds ?? [], now: () => time,
+    getMapUrl: options.getMapUrl,
   });
   const message = (id, text, extra = {}) => ({ message: { from: { id }, chat: { id, type: 'private' }, text, ...extra } });
   const send = async (value, id = 11, extra = {}) => { time += 1001; await bot.handleUpdate(message(id, value, extra)); };
@@ -47,11 +48,26 @@ test('private access requires an invitation; /id remains available and the invit
   await f.send('/start@mappi_bot friends-secret');
   assert.deepEqual(f.store.users['11'], { favorites: [] });
   assert.equal(f.saves(), 1);
-  assert.equal(f.last().reply_markup.keyboard[0][0].request_location, true);
+  assert.ok(f.last().reply_markup.keyboard.flat().some(button => button.request_location === true));
   assert.match(f.last().text, /Київ/);
   assert.ok(!JSON.stringify(f.sent).includes('friends-secret'));
   await f.send('/city вокзал, Львів');
   assert.deepEqual(f.providerCalls[0], ['searchPlaces', 'вокзал, Львів']);
+});
+
+test('Mini App links require private access and use the current tunnel URL', async () => {
+  let url = 'https://first.trycloudflare.com/';
+  const f = fixture({ getMapUrl: () => url });
+  await f.send('/map');
+  assert.ok(!JSON.stringify(f.sent).includes(url));
+  await f.send('/start friends-secret');
+  assert.equal(f.sent.at(-2).reply_markup.inline_keyboard[0][0].web_app.url, url);
+  url = 'https://second.trycloudflare.com/';
+  await f.send('/map');
+  assert.equal(f.last().reply_markup.inline_keyboard[0][0].web_app.url, url);
+  await f.send('/forget');
+  await f.send('/map');
+  assert.match(f.last().text, /приватний бот/);
 });
 
 test('configured users are allowed without saving their search or geographic position', async () => {

@@ -8,6 +8,7 @@ const MAX_ACTIONS = 80;
 const MAX_FAVORITES = 20;
 const MENU = {
   keyboard: [
+    [{ text: '🗺 Карта Києва' }],
     [{ text: '📍 Зупинки поруч', request_location: true }],
     [{ text: '🔎 Пошук місця' }, { text: '⭐ Обране' }],
     [{ text: '🚌 GPS Київ' }, { text: 'ℹ️ Покриття' }],
@@ -61,7 +62,7 @@ function clockTime(value) {
 }
 
 /** Build the private bot without networking or starting a polling loop. */
-export function createBot({ telegram, providers, store, inviteCode, allowedUserIds = [], now = Date.now }) {
+export function createBot({ telegram, providers, store, inviteCode, allowedUserIds = [], now = Date.now, getMapUrl = () => '', onForget = () => {} }) {
   if (!telegram?.call || !providers || !store?.users || typeof store.save !== 'function') {
     throw new TypeError('Bot requires telegram, providers and a persistent store');
   }
@@ -105,7 +106,16 @@ export function createBot({ telegram, providers, store, inviteCode, allowedUserI
   }
 
   async function menu(chatId) {
+    if (getMapUrl()) await showMap(chatId);
     return send(chatId, '🇺🇦 Маппі — транспорт поруч. Основне місто — Київ.\n\nНадішліть геолокацію або назву місця в Києві, наприклад «Контрактова площа». Покажу найближчі зупинки. Для іншого міста вкажіть його через кому або використайте /city.\n\n/city вокзал, Львів — пошук по Україні\n/favorites — обране\n/live — експериментальний GPS Києва\n/live 104 — фільтр маршруту\n/coverage — покриття\n/forget — видалити мої збережені дані\n/id — мій Telegram ID\n\nКоординати не зберігаю на диску. Зупинка потрапляє до обраного лише за вашим натисканням. Тимчасові результати доступні до 15 хвилин.', { reply_markup: MENU });
+  }
+
+  async function showMap(chatId) {
+    const url = getMapUrl();
+    if (!url) return send(chatId, 'Карта запускається на ПК. Спробуйте /map за кілька секунд.');
+    return send(chatId, '🗺 Карта Києва: транспорт, маршрути й зупинки. GPS охоплює лише частину міського транспорту.', {
+      reply_markup: { inline_keyboard: [[{ text: '🗺 Відкрити карту', web_app: { url } }]] }
+    });
   }
 
   async function nearby(id, chatId, position) {
@@ -261,6 +271,7 @@ export function createBot({ telegram, providers, store, inviteCode, allowedUserI
         const previous = store.users[id];
         delete store.users[id];
         try { await store.save(); } catch (error) { if (previous) store.users[id] = previous; throw error; }
+        onForget(id);
         sessions.delete(id);
         return await send(chatId, 'Збережені дані й тимчасовий пошук видалено. Для повторного входу скористайтеся запрошенням.', { reply_markup: { remove_keyboard: true } });
       }
@@ -270,6 +281,7 @@ export function createBot({ telegram, providers, store, inviteCode, allowedUserI
         return await nearby(id, chatId, position);
       }
       if (command?.name === 'help') return await menu(chatId);
+      if (command?.name === 'map' || value === '🗺 Карта Києва') return await showMap(chatId);
       if (command?.name === 'coverage' || value === 'ℹ️ Покриття') return await send(chatId, COVERAGE);
       if (command?.name === 'favorites' || value === '⭐ Обране') return await favorites(id, chatId);
       if (command?.name === 'live' || value === '🚌 GPS Київ') return await live(id, chatId, command?.args ?? '');

@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#101c35">
+  <meta name="color-scheme" content="light">
+  <title>Mappi · транспорт Києва</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='12' fill='%23101c35'/%3E%3Cpath d='M9 28V12l11 9 11-9v16' fill='none' stroke='%232be2dc' stroke-width='5' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js"></script>
+  <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
+  <script src="/vendor/leaflet/leaflet.js" defer></script>
+</head>
+<body>
+  <section id="welcome" class="welcome" aria-labelledby="welcome-title">
+    <div class="welcome-grid" aria-hidden="true"></div>
+    <div class="welcome-card">
+      <div class="brand-symbol brand-symbol-large" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M5 25V7l11 10L27 7v18"/></svg></div>
+      <p class="eyebrow">ТРАНСПОРТ ПОРУЧ</p>
+      <h1 id="welcome-title">Mappi</h1>
+      <p id="welcome-message">Відкрийте карту через кнопку в приватному Telegram-боті. Доступ — для вас і запрошених друзів.</p>
+      <a id="open-bot" class="button button-primary" href="https://t.me/MappiBashmakBot" target="_blank" rel="noopener">Відкрити в Telegram <span aria-hidden="true">↗</span></a>
+      <p id="auth-status" class="welcome-note" role="status">Київ · маршрути, зупинки та GPS</p>
+    </div>
+  </section>
+
+  <main id="application" class="application" hidden>
+    <div id="map" role="region" aria-label="Карта транспорту Києва"></div>
+    <header class="topbar">
+      <a class="brand" href="#" id="home" aria-label="Mappi — карта Києва">
+        <span class="brand-symbol" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M5 25V7l11 10L27 7v18"/></svg></span>
+        <span>Mappi<span class="brand-dot">.</span></span>
+      </a>
+      <div class="city-pill"><span class="city-dot" aria-hidden="true"></span>Київ<span class="city-country"> / UA</span></div>
+      <button id="about-button" class="icon-button header-info" type="button" aria-label="Джерела й покриття"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7v.5"/></svg></button>
+    </header>
+
+    <div class="map-status" role="status" aria-live="polite">
+      <span id="connection-dot" class="connection-dot is-loading" aria-hidden="true"></span>
+      <span id="live-status">Завантаження GPS…</span>
+    </div>
+    <div id="route-map-label" class="route-map-label" hidden>
+      <button id="open-route-detail" type="button" class="route-map-main" aria-label="Відкрити зупинки вибраного маршруту"><span id="route-map-ref" class="route-number"></span><span id="route-map-name"></span></button>
+      <button id="clear-route" type="button" class="icon-button" aria-label="Прибрати маршрут з карти">×</button>
+    </div>
+    <div class="map-controls" aria-label="Керування картою">
+      <button id="zoom-in" class="map-control" type="button" aria-label="Наблизити карту"><span aria-hidden="true">+</span></button>
+      <button id="zoom-out" class="map-control" type="button" aria-label="Віддалити карту"><span aria-hidden="true">−</span></button>
+      <span class="control-divider" aria-hidden="true"></span>
+      <button id="locate" class="map-control" type="button" aria-label="Знайти моє місце"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg></button>
+      <button id="refresh" class="map-control" type="button" aria-label="Оновити GPS"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6 7a7 7 0 0 1 12-1l2 3M4 15l2 3a7 7 0 0 0 12-1"/></svg></button>
+    </div>
+
+    <section id="sheet" class="sheet is-collapsed" aria-label="Транспорт і пошук">
+      <button id="sheet-toggle" class="sheet-toggle" type="button" aria-label="Розгорнути панель" aria-expanded="false"><span></span></button>
+      <div class="sheet-heading">
+        <div><p class="eyebrow" id="sheet-kicker">КИЇВ · ЗАРАЗ</p><h1 id="sheet-title">Транспорт на карті</h1></div>
+        <span class="partial-badge" title="GPS охоплює лише частину транспорту"><span aria-hidden="true"></span>Частковий GPS</span>
+      </div>
+      <nav class="tabbar" aria-label="Розділи карти">
+        <button type="button" class="tab is-active" data-tab="map-panel" aria-current="page"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 6 6-3 6 3 6-3v15l-6 3-6-3-6 3V6ZM9 3v15M15 6v15"/></svg><span>Карта</span></button>
+        <button type="button" class="tab" data-tab="routes-panel"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="5" r="2"/><circle cx="18" cy="19" r="2"/><path d="M8 5h7a4 4 0 0 1 0 8H9a3 3 0 0 0 0 6h7"/></svg><span>Маршрути</span></button>
+        <button type="button" class="tab" data-tab="search-panel"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span>Пошук</span></button>
+        <button type="button" class="tab" data-tab="favorites-panel"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.8 5.8 6.4.9-4.6 4.5 1.1 6.4L12 17.6l-5.7 3 1.1-6.4L2.8 9.7l6.4-.9L12 3Z"/></svg><span>Обране</span></button>
+      </nav>
+      <div class="sheet-content">
+        <section id="map-panel" class="panel" aria-label="Поточний транспорт">
+          <div class="live-summary"><span class="live-summary-icon" aria-hidden="true">↗</span><div><strong id="live-count">Завантажуємо позиції</strong><p id="live-updated">Лише координати не старші 3 хвилин</p></div></div>
+          <button id="nearby" type="button" class="button button-primary nearby-button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 10c0 5-7 11-7 11S5 15 5 10a7 7 0 1 1 14 0Z"/><circle cx="12" cy="10" r="2.5"/></svg>Зупинки в центрі карти<span aria-hidden="true">→</span></button>
+          <p class="field-note">Перемістіть карту до потрібного місця й натисніть кнопку.</p>
+          <div id="nearby-results" class="result-list"></div>
+          <div class="map-legend"><span><i class="legend-dot"></i>GPS транспорту</span><span><i class="legend-stop"></i>Зупинка</span><span>Без прогнозу прибуття</span></div>
+        </section>
+
+        <section id="routes-panel" class="panel" aria-label="Маршрути Києва" hidden>
+          <div id="route-catalog">
+            <label class="search-field" for="route-query"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><input id="route-query" type="search" placeholder="Номер або назва маршруту" maxlength="100" autocomplete="off"></label>
+            <div id="mode-filters" class="mode-filters" aria-label="Тип транспорту">
+              <button type="button" data-mode="all" class="mode-chip is-active" aria-pressed="true">Усі</button>
+              <button type="button" data-mode="bus" class="mode-chip" aria-pressed="false">Автобус</button>
+              <button type="button" data-mode="trolleybus" class="mode-chip" aria-pressed="false">Тролейбус</button>
+              <button type="button" data-mode="tram" class="mode-chip" aria-pressed="false">Трамвай</button>
+              <button type="button" data-mode="subway" class="mode-chip" aria-pressed="false">Метро</button>
+            </div>
+            <div class="list-heading"><span id="routes-count">Каталог OpenStreetMap</span><span>За напрямками</span></div>
+            <div id="routes-results" class="result-list" aria-live="polite"></div>
+          </div>
+          <div id="route-detail" hidden></div>
+        </section>
+
+        <section id="search-panel" class="panel" aria-label="Пошук місця" hidden>
+          <form id="place-search" class="place-search"><label for="place-query" class="field-label">Куди дивимося?</label><div class="search-form-row"><label class="search-field" for="place-query"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><input id="place-query" type="search" placeholder="Місце або адреса" maxlength="160" required autocomplete="off"></label><button id="search-submit" class="button button-primary" type="submit" aria-label="Знайти місце">→</button></div><p class="field-note">За замовчуванням — Київ. Інше місто: «вокзал, Львів».</p></form>
+          <div id="search-results" class="result-list"><div class="empty-state"><span class="empty-symbol" aria-hidden="true">⌕</span><h2>Знайдіть своє місце</h2><p>Вулиця, площа або вокзал. Після пошуку покажемо місце та зупинки поруч.</p></div></div>
+        </section>
+
+        <section id="favorites-panel" class="panel" aria-label="Обрані зупинки" hidden>
+          <div class="list-heading"><span>Ваші зупинки</span><span>Лише на цьому пристрої</span></div>
+          <div id="favorites-results" class="result-list"></div>
+          <button id="clear-favorites" class="text-button clear-favorites" type="button" hidden>Очистити обране на цьому пристрої</button>
+        </section>
+      </div>
+    </section>
+    <div id="toast" class="toast" role="status" hidden></div>
+
+    <dialog id="about-dialog" class="about-dialog">
+      <div class="dialog-heading"><h2>Про карту</h2><button id="close-about" class="icon-button" type="button" aria-label="Закрити">×</button></div>
+      <p>Mappi показує маршрути та зупинки з OpenStreetMap і GPS транспорту Києва з міського джерела.</p>
+      <div class="source-item"><span class="source-dot"></span><div><strong>GPS · часткове покриття</strong><p>Лише власні часові позначки позицій не старші 3 хвилин. Відсутність машини на карті не означає, що рейсів немає. Прогнозу прибуття немає.</p></div></div>
+      <div class="source-item"><span class="source-dot osm"></span><div><strong>Маршрути та зупинки · OpenStreetMap</strong><p>Довідкові дані можуть бути неповними. Напрямки показано окремо, як їх внесено до карти; актуальність руху не гарантована.</p></div></div>
+      <p class="privacy-note">Обране зберігається лише в цьому браузері. Геолокацію запитуємо після натискання кнопки.</p>
+      <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener" class="source-link">© OpenStreetMap contributors ↗</a>
+      <button id="close-about-bottom" class="button button-primary" type="button">Зрозуміло</button>
+    </dialog>
+  </main>
+</body>
+</html>

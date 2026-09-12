@@ -8,3 +8,10 @@ data/
 node_modules/
 .DS_Store
 coverage/
+map-preview.txt
+map-url.txt
+invite.txt
+stop.request
+cloudflared.exe
+tunnel-provider.txt
+localhost-run-known-hosts*
