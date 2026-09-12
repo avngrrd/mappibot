@@ -1,0 +1,20 @@
+{
+  "name": "mappibot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Особистий Telegram-помічник громадського транспорту України",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/main.mjs",
+    "test": "node --test",
+    "check": "node --check src/main.mjs && node --check src/bot.mjs && node --check src/providers.mjs",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "gtfs-realtime-bindings": "^2.2.0",
+    "proper-lockfile": "^4.1.2"
+  }
+}
